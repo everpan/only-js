@@ -1,0 +1,129 @@
+//! db/DB(name) 数据访问绑定（移植自 Go db.go + accessor.go）。
+//!
+//! 与 Go 版一致：db === DB("default")（引用相等由 bootstrap.js 侧的实例缓存保证），
+//! 未配置的名字 DB(name) 返回 undefined。实例存在性检查在 Rust 侧（op_db_has）。
+//! Go DataAccessor 的可变参数 args ...any 在 bridge 层从未被使用，故本版只传 SQL。
+//!
+//! 安全性：新增 `query_with_params` / `exec_with_params` 以支持绑定参数，杜绝 JS 侧字符串拼接
+//! （原始 `query(sql)` 仅保留为无参便捷形式；真实 SQL 实现应优先用 *_with_params 或 query.rs 构造器）。
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::{Arc, RwLock};
+
+use async_trait::async_trait;
+use deno_core::{OpState, op2};
+use deno_error::JsErrorBox;
+use serde_json::Value;
+
+use super::{BridgeResult, Shared, StableState};
+
+/// 数据访问返回的单行（JSON 对象）。
+pub type Row = Value;
+
+/// 数据访问统一契约（接口隔离 + 依赖倒置）。
+/// M0 用内存 fake；后续 sqlx 以同接口接入（`query_with_params` 参数化），handler 无需改动。
+#[async_trait]
+pub trait DataAccessor: Send + Sync {
+    /// 无参查询（便捷形式）。
+    async fn query(&self, sql: &str) -> BridgeResult<Vec<Row>> {
+        self.query_with_params(sql, &[]).await
+    }
+    /// 无参执行（便捷形式）。
+    async fn exec(&self, sql: &str) -> BridgeResult<i64> {
+        self.exec_with_params(sql, &[]).await
+    }
+    /// 参数化查询（值经绑定，杜绝拼接注入）。
+    async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<Row>>;
+    /// 参数化执行，返回受影响行数。
+    async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64>;
+}
+
+/// DataAccessor 的内存实现（fake）。接口与未来 sqlx 实现一致（Liskov 可替换）。
+#[derive(Default)]
+pub struct InMemoryAccessor {
+    inner: RwLock<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    rows: Vec<Row>,
+    err: Option<String>,
+}
+
+impl InMemoryAccessor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 预置数据（测试/演示用）。
+    pub fn seed(&self, rows: impl IntoIterator<Item = Row>) {
+        self.inner.write().unwrap().rows.extend(rows);
+    }
+
+    /// 注入查询错误（测试错误传播路径）。
+    pub fn set_error(&self, msg: impl Into<String>) {
+        self.inner.write().unwrap().err = Some(msg.into());
+    }
+}
+
+#[async_trait]
+impl DataAccessor for InMemoryAccessor {
+    async fn query_with_params(&self, _sql: &str, _params: &[Value]) -> BridgeResult<Vec<Row>> {
+        let g = self.inner.read().unwrap();
+        if let Some(e) = &g.err {
+            return Err(e.clone().into());
+        }
+        Ok(g.rows.clone())
+    }
+
+    async fn exec_with_params(&self, _sql: &str, _params: &[Value]) -> BridgeResult<i64> {
+        let g = self.inner.read().unwrap();
+        if let Some(e) = &g.err {
+            return Err(e.clone().into());
+        }
+        Ok(g.rows.len() as i64)
+    }
+}
+
+/// DB(name) 存在性检查：bootstrap 的 DB 构造器用，未配置则 JS 侧返回 undefined。
+#[op2(fast)]
+pub fn op_db_has(state: &mut OpState, #[string] name: &str) -> bool {
+    state.borrow::<Arc<StableState>>().dbs.contains_key(name)
+}
+
+/// db.query(sql, params?)：Promise<Row[]>。params 可选（无参便捷形式）。
+#[op2]
+#[serde]
+pub async fn op_db_query(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] sql: String,
+    #[serde] params: Option<Vec<Value>>,
+) -> Result<Vec<Row>, JsErrorBox> {
+    let params = params.unwrap_or_default();
+    super::query::lookup(&state, &name)?
+        .query_with_params(&sql, &params)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))
+}
+
+/// db.exec(sql, params?)：Promise<受影响行数>。
+#[op2]
+#[serde]
+pub async fn op_db_exec(
+    state: Rc<RefCell<OpState>>,
+    #[string] name: String,
+    #[string] sql: String,
+    #[serde] params: Option<Vec<Value>>,
+) -> Result<i64, JsErrorBox> {
+    let params = params.unwrap_or_default();
+    super::query::lookup(&state, &name)?
+        .exec_with_params(&sql, &params)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))
+}
+
+/// 旧 `Shared` 类型兼容别名（部分模块仍引用）。
+#[allow(dead_code)]
+pub type _SharedCompat = Shared;

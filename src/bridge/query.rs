@@ -1,0 +1,243 @@
+//! 安全查询构造器：以 sea-query 动态构建 SELECT，标识符全部来自 SchemaRegistry 白名单，
+//! 值经参数化绑定。JS 侧经 `db.table(name).select(cols).where({field:op:val}).orderBy([...]).limit(n).all()` 调用。
+//!
+//! 设计取舍（见评审修订）：
+//!   - v1 仅 `AND` 组合，无 `$or`/`$not`（后续可加深度/子句数上限）。
+//!   - 过滤操作符收敛为类型化枚举：eq/ne/gt/gte/lt/lte/in/like/isNull。
+//!   - orderBy 为 `[{field, dir}]`，不解析 SQL 片段。
+//!   - limit 默认 100、硬上限 1000。
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use deno_core::{OpState, op2};
+use deno_error::JsErrorBox;
+use sea_query::{Alias, Expr, LikeExpr, Order, PostgresQueryBuilder, Query, SimpleExpr, Value as Qv};
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::registry::SchemaRegistry;
+use super::{BridgeResult, DataAccessor, StableState};
+
+/// 过滤操作符（类型化枚举，拒绝未知 `$op`）。
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Op {
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    #[serde(rename = "in")]
+    In,
+    Like,
+    IsNull,
+}
+
+/// 单条过滤条件（列名 + 操作符 + 值）。
+#[derive(Debug, Clone, Deserialize)]
+struct Cond {
+    field: String,
+    op: Op,
+    #[serde(default)]
+    value: Option<Value>,
+}
+
+/// 排序项。
+#[derive(Debug, Clone, Deserialize)]
+struct OrderBy {
+    field: String,
+    #[serde(default)]
+    dir: Option<String>,
+}
+
+/// 一次查询构建请求（结构化，非 SQL 字符串）。
+#[derive(Debug, Clone, Deserialize)]
+struct QueryReq {
+    table: String,
+    #[serde(default)]
+    columns: Vec<String>,
+    #[serde(default)]
+    conditions: Vec<Cond>,
+    #[serde(default)]
+    order_by: Vec<OrderBy>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
+const LIMIT_DEFAULT: u32 = 100;
+const LIMIT_MAX: u32 = 1000;
+
+fn registry(state: &Rc<RefCell<OpState>>) -> Result<Arc<SchemaRegistry>, JsErrorBox> {
+    Ok(state
+        .borrow()
+        .borrow::<Arc<StableState>>()
+        .registry
+        .clone())
+}
+
+fn to_qv(v: &Value) -> Qv {
+    match v {
+        Value::Null => Qv::String(None),
+        Value::Bool(b) => Qv::Bool(Some(*b)),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Qv::BigInt(Some(i.into()))
+            } else if let Some(f) = n.as_f64() {
+                Qv::Float(Some((f as f32).into()))
+            } else {
+                Qv::String(None)
+            }
+        }
+        Value::String(s) => Qv::from(s.clone()),
+        other => Qv::from(other.to_string()),
+    }
+}
+
+fn build_expr(col: &str, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsErrorBox> {
+    let c = Expr::col(Alias::new(col));
+    let rhs = |v: &Value| Expr::val(to_qv(v)).into();
+    Ok(match op {
+        Op::Eq => c.eq(rhs(val.as_ref().unwrap_or(&Value::Null))),
+        Op::Ne => c.ne(rhs(val.as_ref().unwrap_or(&Value::Null))),
+        Op::Gt => c.gt(rhs(val.as_ref().ok_or_else(|| JsErrorBox::generic("gt needs value"))?)),
+        Op::Gte => c.gte(rhs(val.as_ref().ok_or_else(|| JsErrorBox::generic("gte needs value"))?)),
+        Op::Lt => c.lt(rhs(val.as_ref().ok_or_else(|| JsErrorBox::generic("lt needs value"))?)),
+        Op::Lte => c.lte(rhs(val.as_ref().ok_or_else(|| JsErrorBox::generic("lte needs value"))?)),
+        Op::In => {
+            let arr = val
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| JsErrorBox::generic("in needs array value"))?;
+            let vals: Vec<SimpleExpr> = arr.iter().map(|v| rhs(v)).collect();
+            c.is_in(vals)
+        }
+        Op::Like => {
+            let v = val
+                .as_ref()
+                .ok_or_else(|| JsErrorBox::generic("like needs value"))?;
+            let pat = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            c.like(LikeExpr::new(pat))
+        }
+        Op::IsNull => c.is_null(),
+    })
+}
+
+/// op_db_query_build：结构化查询 -> 参数化 SQL -> DataAccessor.query_with_params。
+/// 标识符（表/列）全部经 SchemaRegistry 白名单校验；值参数化。
+#[op2]
+#[serde]
+pub async fn op_db_query_build(
+    state: Rc<RefCell<OpState>>,
+    #[serde] req: QueryReq,
+) -> Result<Vec<Value>, JsErrorBox> {
+    let reg = registry(&state)?;
+    let table = reg
+        .get(&req.table)
+        .ok_or_else(|| JsErrorBox::generic(format!("unknown table '{}'", req.table)))?;
+
+    // 列白名单校验（空 = SELECT *）。
+    let cols: Vec<Alias> = if req.columns.is_empty() {
+        table.columns.keys().map(|c| Alias::new(c.clone())).collect()
+    } else {
+        req.columns
+            .iter()
+            .map(|c| {
+                if !table.has_column(c) {
+                    Err(JsErrorBox::generic(format!("unknown column '{c}' on '{}'", req.table)))
+                } else {
+                    Ok(Alias::new(c.clone()))
+                }
+            })
+            .collect::<Result<_, _>>()?
+    };
+
+    let mut q = Query::select();
+    q.columns(cols).from(Alias::new(&req.table));
+
+    for c in &req.conditions {
+        if !table.has_column(&c.field) {
+            return Err(JsErrorBox::generic(format!(
+                "unknown column '{}' in where",
+                c.field
+            )));
+        }
+        q.and_where(build_expr(&c.field, c.op, &c.value)?);
+    }
+
+    for o in &req.order_by {
+        if !table.is_sortable(&o.field) {
+            return Err(JsErrorBox::generic(format!(
+                "column '{}' not sortable",
+                o.field
+            )));
+        }
+        let dir = match o.dir.as_deref() {
+            Some("desc") => Order::Desc,
+            _ => Order::Asc,
+        };
+        q.order_by(Alias::new(&o.field), dir);
+    }
+
+    let limit = req.limit.unwrap_or(LIMIT_DEFAULT).min(LIMIT_MAX);
+    q.limit(limit as u64);
+    if let Some(off) = req.offset {
+        q.offset(off as u64);
+    }
+
+    let (sql, values) = q.build(PostgresQueryBuilder);
+    let params: Vec<Value> = values
+        .into_iter()
+        .map(|v| value_to_json(&v))
+        .collect::<Result<_, _>>()?;
+
+    let da = lookup(&state, "default")?;
+    da.query_with_params(&sql, &params)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))
+}
+
+/// sea-query 的 `Value` 转 serde_json::Value（简化：整数/浮点/字符串/布尔/ null）。
+fn value_to_json(v: &Qv) -> Result<Value, JsErrorBox> {
+    let num = |f: f64| {
+        serde_json::Number::from_f64(f)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
+    };
+    Ok(match v {
+        Qv::Bool(Some(b)) => Value::Bool(*b),
+        Qv::TinyInt(Some(i)) => Value::from(*i),
+        Qv::SmallInt(Some(i)) => Value::from(*i),
+        Qv::Int(Some(i)) => Value::from(*i),
+        Qv::BigInt(Some(i)) => Value::from(*i),
+        Qv::Float(Some(f)) => num(*f as f64),
+        Qv::Double(Some(f)) => num(*f),
+        Qv::String(Some(s)) => Value::String(s.to_string()),
+        _ => Value::Null,
+    })
+}
+
+/// 按名取 DataAccessor（默认 default；后续可扩展命名实例）。
+pub(crate) fn lookup(
+    state: &Rc<RefCell<OpState>>,
+    name: &str,
+) -> Result<Arc<dyn DataAccessor>, JsErrorBox> {
+    state
+        .borrow()
+        .borrow::<Arc<StableState>>()
+        .dbs
+        .get(name)
+        .cloned()
+        .ok_or_else(|| JsErrorBox::generic(format!("db: instance '{name}' not configured")))
+}
+
+/// 仅用于 trait 约束引用，避免 unused import 警告。
+#[allow(dead_code)]
+fn _assert(_: &BridgeResult<()>) {}
