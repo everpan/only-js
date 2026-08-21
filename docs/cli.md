@@ -75,7 +75,7 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
 | 2 | Server 层（axum） | 高 | ✅ done `61d7c2b` | P1 | 中（实际三模块 router/actor/axum，actor 模式一次成型） |
 | 3 | config 层 | 高 | ✅ done `1ba0d72` | — | 小 |
 | 4 | Server 生命周期 | 高 | ✅ done `8f27a32` | P3+P4-glue | 中（watchdog 408 + devserver 装配 + 冒烟全通） |
-| 5 | WebSocket 帧循环 | 中 | ✅ done（P5 commit 见 §6） | P2 | 大（5a echo 链路验证 + 5b 三任务流水线，一次通过） |
+| 5 | WebSocket 帧循环 | 中 | ✅ done `a99a976` | P2 | 大（5a echo 链路验证 + 5b 三任务流水线，一次通过） |
 | 6 | 性能优化 | 高 | 🟢 | — | 小（多数已实现） |
 
 ### 2.1 Phase 0 — ASCII 校验 / build 绿（🟢 trivial）
