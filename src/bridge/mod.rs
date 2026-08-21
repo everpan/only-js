@@ -32,6 +32,7 @@ mod log;
 mod query;
 mod registry;
 mod runtime;
+mod ws;
 
 pub use db::{DataAccessor, InMemoryAccessor, Row};
 pub use accessor_sqlx::SqlxAccessor;
@@ -68,6 +69,10 @@ pub struct ReqState {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub done: bool,
+    /// WS 帧循环专用：ws.send 收集（处理器结束后按序写出，先于信封响应）。
+    pub ws_sends: Vec<String>,
+    /// WS 帧循环专用：ws.close 置位 → 本帧结束后关闭连接。
+    pub ws_close: bool,
 }
 
 impl ReqState {
@@ -78,6 +83,8 @@ impl ReqState {
         self.status = 200;
         self.headers.clear();
         self.done = false;
+        self.ws_sends.clear();
+        self.ws_close = false;
     }
 }
 
@@ -100,6 +107,8 @@ deno_core::extension!(
         query::op_db_query_build,
         fetch::op_fetch,
         log::op_log,
+        ws::op_ws_send,
+        ws::op_ws_close,
     ],
     esm_entry_point = "ext:bridge_ext/bootstrap.js",
     esm = [dir "src/bridge", "bootstrap.js"],
@@ -257,6 +266,16 @@ impl Bridge {
         req: RequestInfo,
         timeout: std::time::Duration,
     ) -> Result<Capture, RunError> {
+        self.run_ws(source, req, timeout).await.map(|o| o.capture)
+    }
+
+    /// WS 帧执行：同 run_with_timeout，额外带出 ws.send 收集与 ws.close 置位。
+    pub async fn run_ws(
+        &self,
+        source: &str,
+        req: RequestInfo,
+        timeout: std::time::Duration,
+    ) -> Result<WsOutcome, RunError> {
         let mut rt = self.pool.checkout();
         // isolate 裸指针：仅在 arm..disarm 窗口内被看门狗解引用（窗口内 runtime 存活）。
         let ptr: usize = {
@@ -276,22 +295,34 @@ impl Bridge {
         }
         match result {
             Ok(()) => {
-                let capture = {
+                let outcome = {
                     let op_state = runtime::op_state(&rt);
                     let g = op_state.borrow();
                     let rs = g.borrow::<ReqState>();
-                    Capture {
-                        status: rs.status,
-                        headers: rs.headers.clone(),
-                        body: rs.response.clone().unwrap_or_default(),
+                    WsOutcome {
+                        capture: Capture {
+                            status: rs.status,
+                            headers: rs.headers.clone(),
+                            body: rs.response.clone().unwrap_or_default(),
+                        },
+                        sends: rs.ws_sends.clone(),
+                        close: rs.ws_close,
                     }
                 };
                 self.pool.checkin(rt);
-                Ok(capture)
+                Ok(outcome)
             }
             Err(e) => Err(RunError::Core(e)),
         }
     }
+}
+
+/// WS 帧执行结果：HTTP 捕获 + ws.send 集合 + ws.close 置位。
+#[derive(Debug, Default)]
+pub struct WsOutcome {
+    pub capture: Capture,
+    pub sends: Vec<String>,
+    pub close: bool,
 }
 
 /// handler 执行错误：区分超时熔断（408）与普通失败（500）。
@@ -434,6 +465,36 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"]["n"], 1, "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_global_send_close_and_reset() {
+        // WS 帧循环契约：ws.send 收集到 sends（先于信封写出）、ws.close 置位，帧间重置。
+        let (b, _) = new_bridge();
+        let o = b
+            .run_ws(
+                r#"
+                const ok1 = typeof ws === "object" && typeof ws.send === "function" && typeof ws.close === "function";
+                ws.send("side-a"); ws.send("side-b"); ws.close();
+                json.ok({ ok1 });
+                "#,
+                RequestInfo::default(),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(o.sends, vec!["side-a".to_string(), "side-b".to_string()]);
+        assert!(o.close);
+        let v: Value = serde_json::from_slice(&o.capture.body).unwrap();
+        assert_eq!(v["data"]["ok1"], true, "{v}");
+
+        // 第二帧：sends/close 不串号（ReqState 重置）。
+        let o2 = b
+            .run_ws(r#"json.ok({});"#, RequestInfo::default(), std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(o2.sends.is_empty());
+        assert!(!o2.close);
     }
 
     #[tokio::test(flavor = "current_thread")]

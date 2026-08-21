@@ -20,6 +20,8 @@ import {
   op_kv_get,
   op_kv_set,
   op_log,
+  op_ws_send,
+  op_ws_close,
 } from "ext:core/ops";
 
 // ----- json: unified envelope + response headers -----
@@ -57,6 +59,12 @@ globalThis.log = {
 globalThis.redis = {
   get: (key) => op_kv_get(String(key)),
   set: (key, value) => op_kv_set(String(key), String(value)),
+};
+
+// ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----
+globalThis.ws = {
+  send: (data) => op_ws_send(String(data)),
+  close: () => op_ws_close(),
 };
 
 // ----- db / DB(name): named instances; JS-side cache guarantees identity (db === DB("default")) -----

@@ -3,6 +3,7 @@
 pub mod actor;
 pub mod devserver;
 pub mod router;
+pub mod ws;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -129,15 +130,15 @@ fn parse_query(q: Option<&str>) -> HashMap<String, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use mdm_base_rust::bridge::{Bridge, InMemoryAccessor, InMemoryKV};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    struct TempRoutes(PathBuf);
-    fn routes(files: &[(&str, &str)]) -> TempRoutes {
+    pub(crate) struct TempRoutes(pub(crate) PathBuf);
+    pub(crate) fn routes(files: &[(&str, &str)]) -> TempRoutes {
         static N: AtomicUsize = AtomicUsize::new(0);
         let base = std::env::temp_dir().join(format!(
             "mdm-server-{}-{}",
@@ -158,7 +159,7 @@ mod tests {
         }
     }
 
-    fn actor() -> JsActor {
+    pub(crate) fn actor() -> JsActor {
         JsActor::new(|| {
             Bridge::new(
                 Arc::new(InMemoryAccessor::new()),

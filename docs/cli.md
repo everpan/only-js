@@ -75,7 +75,7 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
 | 2 | Server 层（axum） | 高 | ✅ done `61d7c2b` | P1 | 中（实际三模块 router/actor/axum，actor 模式一次成型） |
 | 3 | config 层 | 高 | ✅ done `1ba0d72` | — | 小 |
 | 4 | Server 生命周期 | 高 | ✅ done `8f27a32` | P3+P4-glue | 中（watchdog 408 + devserver 装配 + 冒烟全通） |
-| 5 | WebSocket 帧循环 | 中 | 🔴 | P2 | 大（见 2.4） |
+| 5 | WebSocket 帧循环 | 中 | ✅ done（P5 commit 见 §6） | P2 | 大（5a echo 链路验证 + 5b 三任务流水线，一次通过） |
 | 6 | 性能优化 | 高 | 🟢 | — | 小（多数已实现） |
 
 ### 2.1 Phase 0 — ASCII 校验 / build 绿（🟢 trivial）
@@ -287,4 +287,13 @@ P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
   warn 后忽略（M0 内存 KV）；HMR 不建 reloader（per-request 读盘=免费热重载）；JsActor 无 shutdown
   接口（进程退出即散，需要时再加）。双绿 18+18。TDD：408/with_dbs/devserver 全 RED→GREEN
   （devserver 5 测含 Go parseArgs 表驱动移植 + bad DSN 上抛）。
+- **[P5]** WebSocket 帧循环完成（全案最大风险项一次通过）：**5a** echo——upgrade 后整个 socket
+  （`WebSocket: Send`）搬到专用 OS 线程的 current_thread runtime，「upgrade + 钉单线程」链路以裸 TCP
+  帧级测试（掩码帧手写）验证。**5b** JS 帧循环（`server/src/ws.rs::js_route` + `frame_loop`）——
+  每连接专用线程 + 专用 Bridge（对齐 Go 每连接独占 VM，不占 HTTP actor 池）；Reader/Writer 两 task +
+  Processor 内联，msgChan/respChan cap 64（满则丢 + warn，对齐 Go）；`bridge::run_ws` 带出
+  `WsOutcome{sends, close}`（ws.send 先于信封写出、ws.close 结束连接）；缺 handler 文件发 Close 帧
+  后退出（修复了裸 drop 导致的 TCP RST）。根 crate 侧：`op_ws_send/op_ws_close` + bootstrap `ws`
+  全局（HTTP 路径不读 ws 字段 = Go nil 连接 no-op）。双绿 root 19 + server 22。TDD 偏差说明：
+  run_ws/ws 全局严格 RED→GREEN；js_route 帧循环实现与测试同批写入（但测试当场抓出 RST bug 并修复）。
 - …（后续每 phase 追加一行）
