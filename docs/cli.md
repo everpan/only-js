@@ -73,8 +73,8 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
 | 0 | ASCII 校验 / build 绿 | 高 | 🟢 | — | trivial |
 | 1 | sqlx 接入 | 高 | ✅ done `7867852` | P0 | 小（实际改动比预估更小：`install_default_drivers` 进 connect + sqlite 方言 + unsigned 修复） |
 | 2 | Server 层（axum） | 高 | ✅ done `61d7c2b` | P1 | 中（实际三模块 router/actor/axum，actor 模式一次成型） |
-| 3 | config 层 | 高 | 🟢 | — | 小 |
-| 4 | Server 生命周期 | 高 | 🟡 | P3+P4-glue | 中 |
+| 3 | config 层 | 高 | ✅ done `1ba0d72` | — | 小 |
+| 4 | Server 生命周期 | 高 | ✅ done（P4 commit 见 §6） | P3+P4-glue | 中（watchdog 408 + devserver 装配 + 冒烟全通） |
 | 5 | WebSocket 帧循环 | 中 | 🔴 | P2 | 大（见 2.4） |
 | 6 | 性能优化 | 高 | 🟢 | — | 小（多数已实现） |
 
@@ -268,4 +268,23 @@ P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
   （per-request 读盘=免费热重载，对齐 Go）；HandlerStore 嵌入 map 留 P4。params 键对齐 Go
   （仅 sub/feature/entity）。TDD 偏差说明：router/actor 严格 RED→GREEN；axum 装配层系实现与测试
   同批写入（E2E 真实 HTTP 覆盖 200/404/500），未先观 RED。
+- **[P3]** commit `1ba0d72`：config 层完成：`load_from(dir, path, env)` 三层叠加（Value 级深合并 =
+  go-yaml「.Unmarshal 进已填充 struct」的语义等价）；显式缺失报错/env 缺失静默/归一化顺序全对齐 Go。
+  取舍：Duration 存字符串（Go 裸数字纳秒形式不支持）；`load_from(dir,..)` 代替依赖进程 CWD
+  （Rust 测试并行，t.Chdir 等价物不存在）。默认 DSN 已改 `sqlite::memory:`
+  （Go 的 `file::memory:?cache=shared` 是 modernc 驱动格式，sqlx 不识别）。
+- **[P4]** Server 生命周期：① **watchdog 熔断**——`KillSwitch`（每 Bridge 一个看门狗线程，
+  25ms 粒度）arm 记 isolate 裸指针 + deadline，到期跨线程 `v8::Isolate::terminate_execution()`
+  （V8 允许），该 runtime **不归还池**；`RunError::Timeout` → actor `RunFail{timeout:true}` →
+  axum 回 **408 信封**（E2E 测 + 冒烟 236ms 熔断 + server 存活均通）。unsafe 集中 runtime.rs
+  单点 + SAFETY 注释。② **devserver 装配**（`server/src/devserver.rs` + bin 薄壳）：
+  parse_args（--config/--env/--generate-config + APP_ENV 回落）→ config 加载 → 逐 `db.<name>`
+  开共享池（对齐 Go 共享 *sql.DB，非 per-actor）→ 仅 default 播种 user_profile（neo/trinity/morpheus）
+  → `Bridge::with_dbs` → `JsActor::pool(PoolSize)` → normalize_addr（":8080"→"0.0.0.0:8080"）。
+  冒烟：Go demo 路由原样返回 3 行种子 + 404/408 信封全对齐。③ **删除 `set_db_accessors`**（零调用方
+  且必 panic：`RuntimePool::new` 已 clone stable → refcount≥2 → `Arc::get_mut` 永 None），
+  改 `with_dbs` 构造期全量注入 + 无 "default" 键回落第一个（Go 防御对齐）。取舍：redis 配置
+  warn 后忽略（M0 内存 KV）；HMR 不建 reloader（per-request 读盘=免费热重载）；JsActor 无 shutdown
+  接口（进程退出即散，需要时再加）。双绿 18+18。TDD：408/with_dbs/devserver 全 RED→GREEN
+  （devserver 5 测含 Go parseArgs 表驱动移植 + bad DSN 上抛）。
 - …（后续每 phase 追加一行）

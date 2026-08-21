@@ -117,7 +117,7 @@ fn op_finish(state: &mut OpState) {
 }
 
 /// 响应捕获（json.ok/fail 写入，server 层读取后写回 HTTP 响应）。
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct Capture {
     pub status: u16,
     pub headers: HashMap<String, String>,
@@ -131,6 +131,8 @@ pub struct Bridge {
     handlers: HandlerStore,
     /// 是否启用 inspector（透传至 runtime 工厂）。
     inspect: bool,
+    /// 超时熔断（每 Bridge 一个看门狗线程）。
+    kill: Arc<runtime::KillSwitch>,
 }
 
 impl Bridge {
@@ -140,16 +142,38 @@ impl Bridge {
         Self::with_opts(db, kv, SchemaRegistry::new(), false)
     }
 
-    /// 含 schema 注册表与 inspector 开关的构造。
+    /// 含 schema 注册表与 inspector 开关的构造（单 db，注册为 "default"）。
     pub fn with_opts(
         db: Arc<dyn DataAccessor>,
         kv: Arc<dyn KVStore>,
         registry: SchemaRegistry,
         inspect: bool,
     ) -> Self {
+        Self::with_dbs(
+            HashMap::from([("default".to_string(), db)]),
+            kv,
+            registry,
+            inspect,
+        )
+    }
+
+    /// 全量命名 DB 构造期注入（对齐 Go buildServer 的 DBAccessors + default 回落）。
+    /// 须在构造期给定全量：StableState 一经 runtime 池共享即不可变。
+    pub fn with_dbs(
+        mut dbs: HashMap<String, Arc<dyn DataAccessor>>,
+        kv: Arc<dyn KVStore>,
+        registry: SchemaRegistry,
+        inspect: bool,
+    ) -> Self {
+        // 防御：无 "default" 键时取任一实例补位（对齐 Go buildServer；JS 侧 db = DB("default")）。
+        if !dbs.contains_key("default") {
+            if let Some(first) = dbs.values().next().cloned() {
+                dbs.insert("default".to_string(), first);
+            }
+        }
         let stable = Arc::new(StableState {
             kv,
-            dbs: HashMap::from([("default".to_string(), db)]),
+            dbs,
             client: reqwest::Client::builder()
                 .no_proxy()
                 .build()
@@ -162,18 +186,8 @@ impl Bridge {
             pool,
             handlers: HandlerStore::from_env(),
             inspect,
+            kill: runtime::KillSwitch::spawn(),
         }
-    }
-
-    /// 合并注入命名 DataAccessor（对应 Go 的 SetDBAccessors），"default" 默认保留。
-    /// 注意：须在首次 checkout runtime 之前调用（StableState 一旦被 runtime 共享即不可变）。
-    pub fn set_db_accessors<I>(&mut self, m: I)
-    where
-        I: IntoIterator<Item = (String, Arc<dyn DataAccessor>)>,
-    {
-        let stable = Arc::get_mut(&mut self.stable)
-            .expect("StableState already shared with pooled runtimes; call before warm/run");
-        stable.dbs.extend(m);
     }
 
     /// 替换 handler 仓库（生产用嵌入 map，开发用 FS 热重载）。
@@ -233,6 +247,66 @@ impl Bridge {
             ))
         })?;
         self.run(&src).await
+    }
+
+    /// 带超时熔断的执行：到期经 V8 terminate_execution 终止（跨线程安全），
+    /// 该 runtime 不归还池，返回 `RunError::Timeout`（对齐 Go 408 语义）。
+    pub async fn run_with_timeout(
+        &self,
+        source: &str,
+        req: RequestInfo,
+        timeout: std::time::Duration,
+    ) -> Result<Capture, RunError> {
+        let mut rt = self.pool.checkout();
+        // isolate 裸指针：仅在 arm..disarm 窗口内被看门狗解引用（窗口内 runtime 存活）。
+        let ptr: usize = {
+            let iso: &mut deno_core::v8::Isolate = &mut *rt.v8_isolate();
+            iso as *mut _ as usize
+        };
+        self.kill.arm(ptr, timeout);
+        {
+            let op_state = runtime::op_state(&rt);
+            let mut g = op_state.borrow_mut();
+            g.borrow_mut::<ReqState>().reset(req);
+        }
+        let result = runtime::run_to_completion(&mut rt, "handler.js", source.to_string()).await;
+        if self.kill.disarm() {
+            // runtime 已被 terminate，不可复用，直接丢弃（不 checkin）。
+            return Err(RunError::Timeout);
+        }
+        match result {
+            Ok(()) => {
+                let capture = {
+                    let op_state = runtime::op_state(&rt);
+                    let g = op_state.borrow();
+                    let rs = g.borrow::<ReqState>();
+                    Capture {
+                        status: rs.status,
+                        headers: rs.headers.clone(),
+                        body: rs.response.clone().unwrap_or_default(),
+                    }
+                };
+                self.pool.checkin(rt);
+                Ok(capture)
+            }
+            Err(e) => Err(RunError::Core(e)),
+        }
+    }
+}
+
+/// handler 执行错误：区分超时熔断（408）与普通失败（500）。
+#[derive(Debug)]
+pub enum RunError {
+    Timeout,
+    Core(CoreError),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::Timeout => write!(f, "handler execution timed out"),
+            RunError::Core(e) => write!(f, "{e}"),
+        }
     }
 }
 
@@ -328,6 +402,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn named_dbs_and_default_fallback() {
+        // 构造期注入全量命名 DB（替代 set_db_accessors——Arc 已被池共享，事后改不可行）。
+        let a = Arc::new(InMemoryAccessor::new());
+        a.seed([json!({"id": 1, "name": "ever"})]);
+        let b = Bridge::with_dbs(
+            HashMap::from([("default".to_string(), a as Arc<dyn DataAccessor>)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new().table("user", Some("id"), &["id", "name"]),
+            false,
+        );
+        let cap = b
+            .run(r#"db.table("user").select(["id"]).all().then((rows) => json.ok({ n: rows.length })).catch((e) => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 1, "{v}");
+
+        // 无 "default" 键 → 回落第一个实例（对齐 Go buildServer 防御）。
+        let only = Arc::new(InMemoryAccessor::new());
+        only.seed([json!({"id": 2, "name": "neo"})]);
+        let b2 = Bridge::with_dbs(
+            HashMap::from([("only".to_string(), only as Arc<dyn DataAccessor>)]),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new().table("user", Some("id"), &["id", "name"]),
+            false,
+        );
+        let cap = b2
+            .run(r#"db.query("select * from user").then((rows) => json.ok({ n: rows.length })).catch((e) => json.fail(500, String(e)));"#)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["n"], 1, "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn unknown_table_rejected() {
         let (b, _) = new_bridge();
         let cap = b
@@ -337,6 +446,23 @@ mod tests {
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["code"], 400);
         assert!(v["msg"].as_str().unwrap().contains("unknown table"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn infinite_loop_times_out_and_bridge_survives() {
+        let (b, _) = new_bridge();
+        let r = b
+            .run_with_timeout(
+                "while (true) {}",
+                RequestInfo::default(),
+                std::time::Duration::from_millis(150),
+            )
+            .await;
+        assert!(matches!(r, Err(RunError::Timeout)), "got: {r:?}");
+        // 超时 runtime 被丢弃，bridge 后续请求正常（池可新开 runtime）。
+        let cap = b.run(r#"json.ok({ alive: true });"#).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["alive"], true);
     }
 
     #[tokio::test(flavor = "current_thread")]

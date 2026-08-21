@@ -68,7 +68,8 @@ impl Default for Config {
             db: HashMap::from([(
                 "default".to_string(),
                 DBConfig {
-                    dsn: "file::memory:?cache=shared".into(),
+                    // Go 用 modernc 方言 "file::memory:?cache=shared"；sqlx 用自身 URL 方言。
+                    dsn: "sqlite::memory:".into(),
                 },
             )]),
             redis: HashMap::new(),
@@ -107,6 +108,31 @@ pub fn load_from(dir: &Path, path: &str, env: &str) -> Result<Config, String> {
 /// `load_from(Path::new("."), ...)` 的便捷形式。
 pub fn load(path: &str, env: &str) -> Result<Config, String> {
     load_from(Path::new("."), path, env)
+}
+
+/// 解析 "5s"/"500ms"/"2m" 形式的时长（Go time.ParseDuration 的常用子集；ns/us 不支持）。
+pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let (num, unit) = s.split_at(
+        s.find(|c: char| !c.is_ascii_digit() && c != '.')
+            .ok_or_else(|| format!("invalid duration {s:?}: no unit"))?,
+    );
+    let n: f64 = num
+        .parse()
+        .map_err(|_| format!("invalid duration {s:?}: bad number"))?;
+    let millis = match unit {
+        "ms" => n,
+        "s" => n * 1000.0,
+        "m" => n * 60_000.0,
+        "h" => n * 3_600_000.0,
+        other => return Err(format!("invalid duration unit {other:?} (支持 ms/s/m/h)")),
+    };
+    Ok(std::time::Duration::from_millis(millis as u64))
+}
+
+/// 写出默认配置（--generate-config 起步配置，对齐 Go WriteDefault）。
+pub fn write_default(path: &str) -> Result<(), String> {
+    let text = serde_yaml::to_string(&Config::default()).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("write default config {path:?}: {e}"))
 }
 
 fn read_yaml(path: &Path) -> Result<Value, String> {
@@ -213,5 +239,24 @@ mod tests {
         let t2 = dir(&[("cfg.yml", "server:\n  base_dir: rt\n")]);
         let cfg2 = load_from(&t2.0, "", "").unwrap();
         assert_eq!(cfg2.server.hmr.root, "rt");
+    }
+
+    #[test]
+    fn parse_duration_supports_common_units() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("5s").unwrap(), Duration::from_secs(5));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("2m").unwrap(), Duration::from_secs(120));
+        assert!(parse_duration("5x").is_err());
+        assert!(parse_duration("s").is_err());
+    }
+
+    #[test]
+    fn write_default_roundtrip() {
+        let t = dir(&[]);
+        let path = t.0.join("gen.yml");
+        write_default(path.to_str().unwrap()).unwrap();
+        let cfg: Config = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(cfg, Config::default());
     }
 }

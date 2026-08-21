@@ -1,6 +1,7 @@
 //! mdm-server：HTTP 层。路由解析（router）+ JS actor 线程桥（actor）+ axum 装配（本文件）。
 
 pub mod actor;
+pub mod devserver;
 pub mod router;
 
 use std::collections::HashMap;
@@ -22,15 +23,22 @@ use mdm_base_rust::bridge::{fail, RequestInfo};
 pub struct AppState {
     resolver: FileResolver,
     actor: JsActor,
+    /// 单请求超时（None = 不限时）。
+    timeout: Option<std::time::Duration>,
 }
 
 /// 构造 axum 应用：catch-all fallback（对齐 Go fiber 的 `All("/*")`）。
-pub fn app(base_dir: impl Into<PathBuf>, actor: JsActor) -> Router {
+pub fn app(
+    base_dir: impl Into<PathBuf>,
+    actor: JsActor,
+    timeout: Option<std::time::Duration>,
+) -> Router {
     Router::new()
         .fallback(any(handle))
         .with_state(AppState {
             resolver: FileResolver::new(base_dir),
             actor,
+            timeout,
         })
 }
 
@@ -39,9 +47,10 @@ pub async fn serve(
     addr: std::net::SocketAddr,
     base_dir: impl Into<PathBuf>,
     actor: JsActor,
+    timeout: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app(base_dir, actor)).await
+    axum::serve(listener, app(base_dir, actor, timeout)).await
 }
 
 async fn handle(
@@ -74,9 +83,11 @@ async fn handle(
             .collect(),
         body: body.to_vec(),
     };
-    match st.actor.run(source, req).await {
+    match st.actor.run(source, req, st.timeout).await {
         Ok(cap) => capture_response(cap),
-        Err(e) => fail_response(500, &e),
+        // 超时熔断 → 408（对齐 Go dev server）。
+        Err(e) if e.timeout => fail_response(408, &e.msg),
+        Err(e) => fail_response(500, &e.msg),
     }
 }
 
@@ -156,11 +167,11 @@ mod tests {
         })
     }
 
-    async fn spawn_server(base: PathBuf) -> std::net::SocketAddr {
+    async fn spawn_server(base: PathBuf, timeout: Option<std::time::Duration>) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, app(base, actor())).await.unwrap();
+            axum::serve(listener, app(base, actor(), timeout)).await.unwrap();
         });
         addr
     }
@@ -179,7 +190,7 @@ mod tests {
             "crm-v1/user/profile/list/GET.js",
             r#"json.ok({ m: http.method, e: http.params.entity, q: http.query.id });"#,
         )]);
-        let addr = spawn_server(t.0.clone()).await;
+        let addr = spawn_server(t.0.clone(), None).await;
         let resp = raw_http(
             addr,
             "GET /crm-v1/user/profile/list?id=7 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
@@ -195,7 +206,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_route_returns_404_envelope() {
         let t = routes(&[]);
-        let addr = spawn_server(t.0.clone()).await;
+        let addr = spawn_server(t.0.clone(), None).await;
         let resp = raw_http(
             addr,
             "GET /crm-v1/nope/missing/thing HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
@@ -206,9 +217,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handler_timeout_returns_408_envelope() {
+        let t = routes(&[("crm-v1/user/profile/list/GET.js", "while (true) {}")]);
+        let addr = spawn_server(t.0.clone(), Some(std::time::Duration::from_millis(150))).await;
+        let resp = raw_http(
+            addr,
+            "GET /crm-v1/user/profile/list HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 408"), "{resp}");
+        assert!(resp.contains("\"code\":408"), "{resp}");
+        assert!(resp.contains("handler execution timed out"), "{resp}");
+    }
+
+    #[tokio::test]
     async fn handler_error_returns_500_envelope() {
         let t = routes(&[("crm-v1/user/profile/list/GET.js", "this is !!! not js")]);
-        let addr = spawn_server(t.0.clone()).await;
+        let addr = spawn_server(t.0.clone(), None).await;
         let resp = raw_http(
             addr,
             "GET /crm-v1/user/profile/list HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",

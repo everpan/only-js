@@ -10,8 +10,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions};
+use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions, v8};
 
 use super::{StableState, bridge_ext};
 
@@ -77,4 +80,47 @@ pub async fn run_to_completion(
 /// 取 runtime 的 OpState 句柄（用于 checkout 时重置 per-request 状态）。
 pub fn op_state(rt: &JsRuntime) -> Rc<RefCell<deno_core::OpState>> {
     rt.op_state()
+}
+
+/// 超时熔断开关：arm 记录 isolate 裸指针 + deadline；看门狗线程到期跨线程 terminate。
+/// 每个 Bridge 一个实例（对应一个 JS actor 线程，串行执行故单槽足够）。
+#[derive(Default)]
+pub struct KillSwitch {
+    slot: Mutex<Option<(usize, Instant)>>,
+    fired: AtomicBool,
+}
+
+impl KillSwitch {
+    /// 创建并启动看门狗线程（进程生命周期，25ms 轮询粒度）。
+    pub fn spawn() -> Arc<Self> {
+        let sw = Arc::new(Self::default());
+        let t = sw.clone();
+        std::thread::Builder::new()
+            .name("js-watchdog".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(25));
+                let g = t.slot.lock().unwrap();
+                if let Some((ptr, deadline)) = *g {
+                    if Instant::now() >= deadline && !t.fired.load(Ordering::Relaxed) {
+                        // SAFETY: ptr 仅在 arm..disarm 窗口内有效（runtime 存活于窗口内），
+                        // 且 terminate_execution 是 V8 明确允许的跨线程调用。
+                        unsafe { (*(ptr as *const v8::Isolate)).terminate_execution() };
+                        t.fired.store(true, Ordering::Relaxed);
+                    }
+                }
+            })
+            .expect("spawn js-watchdog");
+        sw
+    }
+
+    pub(crate) fn arm(&self, ptr: usize, timeout: Duration) {
+        self.fired.store(false, Ordering::Relaxed);
+        *self.slot.lock().unwrap() = Some((ptr, Instant::now() + timeout));
+    }
+
+    /// 关闭窗口；返回本窗口内是否触发过熔断。
+    pub(crate) fn disarm(&self) -> bool {
+        *self.slot.lock().unwrap() = None;
+        self.fired.swap(false, Ordering::Relaxed)
+    }
 }
