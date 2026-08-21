@@ -1,5 +1,9 @@
 # Rust 版 CLI 实现预案（可行性分析 + 扩充版）
 
+> **状态（2026-08-21）：P0–P6 全部完成**，双绿 root 19 + server 22（debug/release）。
+> 本文档保留计划原文与证伪更正的脉络（原稿 → 复核结论 → 实现记录），供复盘。
+> 未移植项仅剩 Go 侧同样待定的 `Redis(name)` / `XORM(name)`（见 §1.3）。
+
 ## 0. 文档性质与用法
 
 本文件是 **working plan（边做边更新的活文档）**，不是 final design。每完成一个 phase 后，
@@ -12,19 +16,28 @@
 
 ### 1.1 已验证可用（release）
 
-Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.rs` 为默认 bin，
-`src/lib.rs` 暴露 `bridge` 模块）。**无 `crates/`、`build-deps/` 目录**（下文各处若再出现需纠正）。
+Rust 端为 **workspace 双 crate**（P2 起）：根 `mdm-base-rust`（`src/lib.rs` 暴露 `bridge` 与
+`config` 模块，`src/main.rs` 为默认 bin）+ `server`（`mdm-server`：axum HTTP/WS 层，
+含 `bin/devserver.rs` 可执行入口）。
 
-- `cargo build` 通过；**2026-08-21 复验：`cargo test --lib`（debug）与 `cargo test --release --lib` 双绿，各 7 passed, 0 failed**。
-- 核心链路已在 Go 参考（`~/git/golang/mdm-base/internal/bridge`）对齐处实现：
-  - `runtime.rs` — RuntimePool：复用 JsRuntime，bootstrap 只编译一次，后续请求仅执行 handler 源码。
+- `cargo build` 通过；**2026-08-21（P0–P6 完成时）：`cargo test --workspace`（debug）与
+  `--release` 双绿，root 19 passed + server 22 passed, 0 failed**。
+- 核心链路已在 Go 参考（`~/git/golang/mdm-base`）对齐处实现：
+  - `runtime.rs` — RuntimePool：复用 JsRuntime，bootstrap 只编译一次，后续请求仅执行 handler 源码；
+    `KillSwitch` 看门狗（P4）：跨线程 `terminate_execution` 超时熔断，超时 runtime 不归还池。
   - `query.rs` + `registry.rs` — sea-query 动态构建 SELECT，标识符走 SchemaRegistry 白名单，值参数化（SQL 注入根治点）。
   - `db.rs` / `kv.rs` — DataAccessor / KVStore 统一契约 + 内存 fake（Liskov 可替换为 sqlx/redis）。
+  - `accessor_sqlx.rs` — sqlx Any 实现（P1）：sqlite 单连接池，`install_default_drivers` 内聚于 connect。
   - `fetch.rs` — reqwest 实现 fetch，带本地 HTTP 全链路测试。
   - `inspector.rs` — 基于 deno_core 内置 inspector 的 DevTools WS 桥。
   - `loader.rs` — HandlerStore：FS 热重载（notify）+ 嵌入 map。
   - `http.rs` — 请求上下文 RequestInfo（method/params/query/headers/body，移植 Go http.go，server 层填充）。
   - `log.rs` / `json.rs` / `envelope.rs` — 日志绑定、fast JSON op、单遍序列化信封。
+  - `ws.rs`（bridge）— `op_ws_send`/`op_ws_close` + bootstrap `ws` 全局（P5）。
+  - 根 `src/config.rs` — 配置三层叠加（P3）：`Default()` ← `cfg.yml` ← `cfg.<env>.yml` 深合并。
+  - `server/src/router.rs` — Go `Resolve` 移植（P2）；`actor.rs` — JS actor 线程 + channel 桥（P2）；
+    `lib.rs` — axum fallback 装配（P2）+ 408 信封（P4）；`devserver.rs` — CLI 装配/播种/监听（P4）；
+    `ws.rs` — echo 路由 + JS 帧循环 `js_route`（P5）。
 
 ### 1.2 已知缺陷 —— 已清零（P0 完成于 commit `46a8eb8`）
 
@@ -32,34 +45,34 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
 `bootstrap.js` 中文注释触发 debug 全挂。已改为 7-bit ASCII 并修复 debug 测试。
 **2026-08-21 复验：debug / release 双绿，各 7 passed。当前无已知缺陷。**
 
-### 1.3 未移植清单（Go 有、Rust 无）
+### 1.3 移植对照（2026-08-21 P0–P6 完成后更新；原「未移植清单」反转为现状表）
 
-| Go 实现 | Rust 现状 | 说明（2026-08-21 逐条对照 Go 源码核实） |
+| Go 实现 | Rust 现状 | 说明 |
 |---|---|---|
-| `redis.go` `Redis(name)` | 无 | string/hash/list/set/zset；pubsub **仅 publish、无 subscribe**；名字未注册返回 undefined |
-| `xorm.go` `XORM(name)` | 无 | 链式 `table/from/where/limit/orderBy`；终结 `find/get/count/insert/update/delete`；raw `query/exec`；engine 级 `ping/stats/isTableExist/dbMetas/tableInfo`；裸 `xorm` = default；实例按名缓存 |
-| `ws.go` `ws.*` WebSocket | 无 | **仅 `send(data)`/`close()` 两个 op**；三协程 reader/processor/writer，msgChan/respChan 各 cap 64；**每连接独占一个 VM**（不进 HTTP 池），handler 预编译逐帧复跑；每帧默认 10s 超时 |
-| server 层超时熔断 | 无 | Go 用 `vm.Interrupt` → **408** "handler execution timed out"，超时会话丢弃不回池。Rust 路径：`v8::Isolate::terminate_execution`（v8-150.4.0 `isolate.rs:993`，V8 允许跨线程调用）——deno_core 无包装，需 unsafe 存 isolate 指针 |
-| config 层 | 无 | `Config{Server, DB: map, Redis: map}`，`ServerConfig{Addr,BaseDir,Timeout,PoolSize,HMR}`；`--config/--env/--generate-config` |
-| router 层 | 无 | `Resolve(method,path)`：最少 4 段 `{mode}-{version}/{sub}/{feature}/{entity}`，多余段进 Rest；文件名 `ToUpper(method)+".js"`（核实无误） |
-| `internal/hot`（HMR/ProgramCache） | 部分有 | loader.rs 已覆盖 FS 热重载；ProgramCache ≈ `execute_script_with_cache`（P6） |
-| demo DB 种子（default 实例） | 无 | Go main.go 仅为 default 播种演示数据 |
+| `redis.go` `Redis(name)` | **未移植**（唯一残留） | string/hash/list/set/zset；pubsub **仅 publish、无 subscribe**；名字未注册返回 undefined |
+| `xorm.go` `XORM(name)` | **未移植**（唯一残留） | 链式 `table/from/where/limit/orderBy`；终结 `find/get/count/insert/update/delete`；raw `query/exec`；engine 级 `ping/stats/isTableExist/dbMetas/tableInfo`；裸 `xorm` = default；实例按名缓存 |
+| `ws.go` `ws.*` WebSocket | ✅ P5 `a99a976` | 仅 `send(data)`/`close()` 两个 op（对齐）；Reader/Writer task + Processor 内联，msgChan/respChan 各 cap 64；**每连接独占 VM**（专用线程 + 专用 Bridge，不占 HTTP actor 池）；缺 handler 发 Close 帧退出 |
+| server 层超时熔断 | ✅ P4 `8f27a32` | `KillSwitch` 看门狗 → 跨线程 `v8::Isolate::terminate_execution`（v8-150.4.0 `isolate.rs:993`）→ **408** 信封；超时 runtime 丢弃不回池。unsafe 集中 runtime.rs 单点 |
+| config 层 | ✅ P3 `1ba0d72` | `src/config.rs`：三层文件叠加（Value 深合并）；`--config/--env/--generate-config` + APP_ENV 回落 |
+| router 层 | ✅ P2 `61d7c2b` | `server/src/router.rs`：最少 4 段、首段 `-` 切分、`ToUpper(method)+".js"`、多余段进 rest；Go 6 测全移植 |
+| `internal/hot`（HMR/ProgramCache） | ✅ 等价物已齐 | FS 热重载由 per-request 读盘天然覆盖（dev 模式）；ProgramCache ≈ V8 代码缓存——**P6 证伪不可达**（`JsRealm` 为 `pub(crate)`，见 §6） |
+| demo DB 种子（default 实例） | ✅ P4 `8f27a32` | devserver 仅对 default 播种 user_profile（neo/trinity/morpheus），可重复运行 |
 
 另：Go `internal/features` 仅测试沙箱、`internal/observ` 无 .go 文件——**均不移植**。
 
-### 1.4 结构参考（Go 侧，勿照搬目录）
+### 1.4 结构对照（Go 侧 ↔ Rust 侧；2026-08-21 更新为完成态）
 
 ```
-~/git/golang/mdm-base/
-├── internal/bridge/   # 对应 src/bridge/  （已移植 80%）
-├── internal/runtime/  # Session/Pool      （对应 src/bridge/runtime.rs）
-├── internal/server/   # axum/fiber server （待新建 server crate）
-├── internal/router/   # 路径解析          （待移植）
-├── internal/config/   # 配置              （待移植）
-├── internal/hot/      # HMR/ProgramCache  （loader.rs 已覆盖大半）
+~/git/golang/mdm-base/                    mdm-base-rust/（workspace）
+├── internal/bridge/   → src/bridge/          （已移植；ws.go → ws.rs + server/src/ws.rs）
+├── internal/runtime/  → src/bridge/runtime.rs（SessionPool → RuntimePool + KillSwitch）
+├── internal/server/   → server/src/lib.rs    （fiber → axum fallback + 408 信封）
+├── internal/router/   → server/src/router.rs （✅ P2）
+├── internal/config/   → src/config.rs        （✅ P3）
+├── internal/hot/      → per-request 读盘     （✅ 等价物；ProgramCache 证伪不可达）
 ├── internal/features/ # 仅测试沙箱        （不移植）
 ├── internal/observ/   # 空目录            （不移植）
-└── cmd/devserver/     # 装配 + 生命周期   （待移植）
+└── cmd/devserver/     → server/src/devserver.rs + bin/devserver.rs（✅ P4）
 ```
 
 ---
@@ -95,6 +108,7 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
 - ✅ 真实前置约束是 **`sqlx::any::install_default_drivers()`**（`any/mod.rs:35`）：
   AnyPool 首次连接前调用一次，激活已编译进来的 sqlite/mysql/postgres 驱动。
 - `Bridge::set_db_accessors`（`mod.rs:170`）经 `Arc::get_mut` 注入，**须在首次 checkout 之前**（现注释已写明）。
+  **[P4 更正]** 此 API 已删除（`Arc::get_mut` 在池化下永返回 None，必 panic），改为 `with_dbs` 构造期注入。
 - Go 语义对齐（核实）：无 `default` 键时取 map 第一个实例作 default；Go 侧**只注册 sqlite 驱动**
   （modernc.org/sqlite，纯 Go）——「扩 pg/mysql」超出对齐范围，sqlx Any 特性保留即可、不投入。
 
@@ -157,6 +171,12 @@ parseArgs（`--config/--env/--generate-config`）→ `config.Load` → 逐 `db.<
 **风险：** watchdog 的 unsafe isolate 指针是唯一硬点；先不接也不阻塞联调（死循环 handler 占死一个
 actor，新请求会新建 runtime，劣化但不死锁）——**上线前必须有**。
 
+> **[实现更正，P4 `8f27a32`]** ① `set_db_accessors` 改为 `Bridge::with_dbs` 构造期全量注入
+> （原 API 必 panic：`RuntimePool::new` 已 clone stable，refcount≥2，`Arc::get_mut` 永 None——
+> §2.2 中「须在首次 checkout 之前」的描述随之作废）。② unsafe 实际集中在
+> `src/bridge/runtime.rs` 的 `KillSwitch`（非 actor.rs），SAFETY 注释在位。③ 风险项已消除：
+> E2E 408 测试 + 冒烟（236ms 熔断、server 存活）均通过。
+
 ### 2.6 Phase 5 — WebSocket 帧循环（🔴 高，全案最大风险）
 
 **目标：** 移植 Go `ws.go`（已核实）：`ws.*` 仅 `send(data)`（5s 写超时）/`close()` 两个 op；
@@ -183,6 +203,10 @@ HTTP SessionPool），handler 预编译、逐帧在同一 VM 复跑；每帧默�
 2. **5b：** 再叠加 JS handler 帧循环。
 若 5a 的 pin 模式验证通过，5b 只是逻辑填充。
 
+> **[实现记录，P5 `a99a976`]** 按此分两步执行且一次通过；架构微调：未复用 HTTP actor 线程池，
+> 而是每连接专用 OS 线程 + 专用 Bridge（对齐 Go「每连接独立 VM」，不占 HTTP 池）；Processor
+> 内联在连接线程（非独立 task），Reader/Writer 两 task 经 mpsc（cap 64）解耦。
+
 ### 2.7 Phase 6 — 性能优化（🟢 小，多数已实现）
 
 **目标：** 扩 fetch 能力（signal/AbortController）、代码缓存。
@@ -192,6 +216,11 @@ HTTP SessionPool），handler 预编译、逐帧在同一 VM 复跑；每帧默�
 `execute_script_with_cache`（**已核实存在**：deno_core 0.409 `runtime/jsrealm.rs:493`，经 realm 调用；
 当前 runtime.rs 只用了无缓存版 `jsruntime.rs:2020`）。
 
+> **[实现更正，P6 零改动收尾]** 「经 realm 调用」这一前提**证伪**：`JsRealm` 与
+> `JsRuntime::main_realm()` 均为 `pub(crate)`，embedder 拿不到 realm 实例，该方法实际不可调用；
+> 唯一公开钩子 `set_eval_context_code_cache_cbs` 只覆盖 `op_eval_context`。fetch signal
+> Go 版同样没有，parity 即完成。详见 §6。
+
 ---
 
 ## 3. 扩充后的实施顺序（依赖图）
@@ -199,11 +228,11 @@ HTTP SessionPool），handler 预编译、逐帧在同一 VM 复跑；每帧默�
 ```
 P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
   │
-  ├─→ P1 (sqlx) ──→ P2 (axum server + JS actor 线程) ──→ P5a (WS 最小链路) ──→ P5b (WS JS 帧循环)
+  ├─→ P1 (sqlx) ✅ 7867852 ──→ P2 (axum server + JS actor 线程) ✅ 61d7c2b ──→ P5a (WS 最小链路) ──→ P5b (WS JS 帧循环) ✅ a99a976
   │                        ↑
-  └─→ P3 (config) ──→ P4 （生命周期装配 + 408 熔断）
+  └─→ P3 (config) ✅ 1ba0d72 ──→ P4 （生命周期装配 + 408 熔断） ✅ 8f27a32
                                           │
-                                          └──────→ P6 (perf, 可与任意阶段并行)
+                                          └──────→ P6 (perf) ✅ 零改动收尾（代码缓存 API 不可达）
 ```
 
 - **关键路径：** P1 → P2 → P4 → P5a → P5b；P3 与 P1/P2 并行，P6 随时可插。
@@ -217,30 +246,35 @@ P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
 
 | 风险 | 影响 | 对策 | 状态 |
 |---|---|---|---|
-| axum handler future 必须 Send（Bridge !Sync / JsRuntime !Send） | 直接 `.await` 编译不过；硬绕则 isolate 跨线程崩 | P2 建 JS actor 线程 + channel 桥，P5 复用同套 | 架构已定 |
-| sqlx Any 首连前未装驱动 | `AnyPool::connect` 报 no installed driver | 连接前调 `sqlx::any::install_default_drivers()`（0.8.6 `any/mod.rs:35`） | 已知解法 |
-| 死循环 handler 无熔断 | 占死一个 actor 线程 | P4 watchdog + `v8::Isolate::terminate_execution` + 408 + runtime 不回池 | unsafe 单点 |
-| edition 2024 × axum | 编译失败 | P2 第一步 `cargo add axum` 冒烟（edition 按 crate 生效，预期无碍） | 低 |
-| serde_yaml deprecated | 无安全更新 | 内部配置解析，可接受；`Cargo.toml` 注释标注 | 低 |
+| axum handler future 必须 Send（Bridge !Sync / JsRuntime !Send） | 直接 `.await` 编译不过；硬绕则 isolate 跨线程崩 | P2 建 JS actor 线程 + channel 桥，P5 复用同套 | ✅ 已实现并测试（P2/P5） |
+| sqlx Any 首连前未装驱动 | `AnyPool::connect` 报 no installed driver | 连接前调 `sqlx::any::install_default_drivers()`（0.8.6 `any/mod.rs:35`） | ✅ 内聚于 `SqlxAccessor::connect`（P1） |
+| 死循环 handler 无熔断 | 占死一个 actor 线程 | P4 watchdog + `v8::Isolate::terminate_execution` + 408 + runtime 不回池 | ✅ 已实现（KillSwitch，E2E + 冒烟） |
+| edition 2024 × axum | 编译失败 | P2 第一步 `cargo add axum` 冒烟（edition 按 crate 生效，预期无碍） | ✅ 无碍（P2 起 workspace 编译通过） |
+| serde_yaml deprecated | 无安全更新 | 内部配置解析，可接受；`Cargo.toml` 注释标注 | ✅ 接受（P3） |
 | ~~sqlx runtime handler 时序~~ | — | **已证伪**：sqlx 0.8.6 无此 API，feature 编译期已定 | 移除 |
 | ~~debug/release ASCII 不一致~~ | — | P0 已修（`46a8eb8`），双绿 2026-08-21 复验 | 移除 |
+| ~~V8 代码缓存（P6）~~ | — | **已证伪**：`JsRealm` 为 `pub(crate)`，`execute_script_with_cache` 对外不可达 | 移除（零改动收尾） |
 
 ---
 
 ## 5. 测试计划（对照 Go `_test.go`）
 
-每阶段补测试，目标覆盖 Go 侧已有断言：
+每阶段补测试，目标覆盖 Go 侧已有断言（2026-08-21 全部完成，debug/release 双绿）：
 
 - **P0：** ✅ debug/release 双绿（7 测，2026-08-21 复验）。
-- **P1：** sqlite 集成测（建表 → `db.exec` 插入 → `db.table(...)` 读回 + 绑定参数 + 未知表拒绝）。
-- **P2：** router 解析测——移植 Go `router_test.go` 全 6 例（Success / MethodFileMissing /
-  NoVersionSegment / TooFewSegments / ExtraRestCaptured / ModuleHelper）+ actor 桥测
-  （发 RequestInfo → 回 Capture）。
-- **P3：** config 测——移植 `config_test.go` 主干（Defaults / **EnvOverlay=文件叠加** /
-  BaseDirEmpty 回落 / ExplicitConfig 缺失报错）。
-- **P4：** 熔断测：`while(true)` handler → 408 信封、runtime 不回池（池长不涨）。
-- **P5：** WS echo 测（连接→收发→关闭），验证帧循环钉在 actor 线程不回 axum 线程。
-- 端到端：`GET /crm-v1/user/profile/list` → 统一信封（对齐 Go `bridge_test.go`）。
+- **P1：** ✅ `sqlite_roundtrip_via_bridge`（DDL/insert + `db.table` 构造器 + 参数化 `db.query`）；
+  另有 TDD 修复的 unsigned 绑定回归覆盖。
+- **P2：** ✅ router 移植 Go `router_test.go` 全 6 例 + actor 桥测 3 例（单 actor / 错误上抛 / 池分发）+
+  axum E2E（200/404/500 信封，raw TCP）。
+- **P3：** ✅ config 8 测（Defaults / **EnvOverlay=文件叠加** / BaseDirEmpty 回落 / 显式缺失报错 /
+  非法 yaml / parse_duration / write_default 往返）。
+- **P4：** ✅ 熔断 E2E：`while(true)` handler + 150ms → 408 信封；bridge 级
+  `infinite_loop_times_out_and_bridge_survives`（超时 runtime 丢弃、后续请求存活）；
+  `with_dbs` 命名注入 + default 回落；devserver 5 测（parseArgs 表驱动 / generate-config /
+  零配置装配 / 缺失配置报错 / bad DSN 上抛）；冒烟：demo 路由 3 行种子 + 408。
+- **P5：** ✅ WS 4 测：echo 链路（裸 TCP 掩码帧）、逐帧 handler 复跑、`ws.send` 顺序 + `ws.close`、
+  缺 handler 安静关闭；bridge 级 `ws_global_send_close_and_reset`。
+- 端到端：✅ `GET /crm-v1/user/profile/list` → 统一信封（冒烟 + 测试双覆盖）。
 
 ---
 
@@ -273,7 +307,7 @@ P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
   取舍：Duration 存字符串（Go 裸数字纳秒形式不支持）；`load_from(dir,..)` 代替依赖进程 CWD
   （Rust 测试并行，t.Chdir 等价物不存在）。默认 DSN 已改 `sqlite::memory:`
   （Go 的 `file::memory:?cache=shared` 是 modernc 驱动格式，sqlx 不识别）。
-- **[P4]** Server 生命周期：① **watchdog 熔断**——`KillSwitch`（每 Bridge 一个看门狗线程，
+- **[P4]** commit `8f27a32`：Server 生命周期：① **watchdog 熔断**——`KillSwitch`（每 Bridge 一个看门狗线程，
   25ms 粒度）arm 记 isolate 裸指针 + deadline，到期跨线程 `v8::Isolate::terminate_execution()`
   （V8 允许），该 runtime **不归还池**；`RunError::Timeout` → actor `RunFail{timeout:true}` →
   axum 回 **408 信封**（E2E 测 + 冒烟 236ms 熔断 + server 存活均通）。unsafe 集中 runtime.rs
@@ -287,7 +321,7 @@ P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
   warn 后忽略（M0 内存 KV）；HMR 不建 reloader（per-request 读盘=免费热重载）；JsActor 无 shutdown
   接口（进程退出即散，需要时再加）。双绿 18+18。TDD：408/with_dbs/devserver 全 RED→GREEN
   （devserver 5 测含 Go parseArgs 表驱动移植 + bad DSN 上抛）。
-- **[P5]** WebSocket 帧循环完成（全案最大风险项一次通过）：**5a** echo——upgrade 后整个 socket
+- **[P5]** commit `a99a976`：WebSocket 帧循环完成（全案最大风险项一次通过）：**5a** echo——upgrade 后整个 socket
   （`WebSocket: Send`）搬到专用 OS 线程的 current_thread runtime，「upgrade + 钉单线程」链路以裸 TCP
   帧级测试（掩码帧手写）验证。**5b** JS 帧循环（`server/src/ws.rs::js_route` + `frame_loop`）——
   每连接专用线程 + 专用 Bridge（对齐 Go 每连接独占 VM，不占 HTTP actor 池）；Reader/Writer 两 task +
@@ -296,10 +330,15 @@ P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
   后退出（修复了裸 drop 导致的 TCP RST）。根 crate 侧：`op_ws_send/op_ws_close` + bootstrap `ws`
   全局（HTTP 路径不读 ws 字段 = Go nil 连接 no-op）。双绿 root 19 + server 22。TDD 偏差说明：
   run_ws/ws 全局严格 RED→GREEN；js_route 帧循环实现与测试同批写入（但测试当场抓出 RST bug 并修复）。
-- **[P6]** 结论：**零改动收尾**。① `execute_script_with_cache` 存在（jsrealm.rs:493）但**对外不可达**——
-  接收者 `JsRealm` 为 `pub(crate)`（runtime/mod.rs:25）、`JsRuntime::main_realm()` 亦 `pub(crate)`
-  （jsruntime.rs:1417），embedder 拿不到 realm 实例；唯一公开缓存钩子
+- **[P6]** commit `15fe22f`：结论 **零改动收尾**。① `execute_script_with_cache` 存在（jsrealm.rs:493）
+  但**对外不可达**——接收者 `JsRealm` 为 `pub(crate)`（runtime/mod.rs:25）、`JsRuntime::main_realm()`
+  亦 `pub(crate)`（jsruntime.rs:1417），embedder 拿不到 realm 实例；唯一公开缓存钩子
   `set_eval_context_code_cache_cbs` 只覆盖 `op_eval_context` 不覆盖 `execute_script`。计划「换
   with_cache 版」的前提证伪，handler 复跑提速由 runtime 池化（已实现且测试覆盖）承担。
   ② fetch signal/AbortController：Go 版同样没有（计划原文「同 Go 版限制」），parity 即完成，不扩。
-- …（后续每 phase 追加一行）
+
+---
+
+**[收官 2026-08-21]** P0–P6 全部完成（`46a8eb8` → `15fe22f`，7 个实现 commit + 文档收尾）。
+双绿 root 19 + server 22（debug/release 各跑）。Go 能力面对齐完成；残留两项
+（`Redis(name)` / `XORM(name)`）在 Go 侧亦属待定扩展，如需移植另起计划。
