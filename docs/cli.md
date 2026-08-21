@@ -72,7 +72,7 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
 |---|---|---|---|---|---|
 | 0 | ASCII 校验 / build 绿 | 高 | 🟢 | — | trivial |
 | 1 | sqlx 接入 | 高 | ✅ done `7867852` | P0 | 小（实际改动比预估更小：`install_default_drivers` 进 connect + sqlite 方言 + unsigned 修复） |
-| 2 | Server 层（axum） | 高 | 🟡 | P1 | 中（新 crate） |
+| 2 | Server 层（axum） | 高 | ✅ done `61d7c2b` | P1 | 中（实际三模块 router/actor/axum，actor 模式一次成型） |
 | 3 | config 层 | 高 | 🟢 | — | 小 |
 | 4 | Server 生命周期 | 高 | 🟡 | P3+P4-glue | 中 |
 | 5 | WebSocket 帧循环 | 中 | 🔴 | P2 | 大（见 2.4） |
@@ -261,4 +261,11 @@ P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
   TDD 暴露并修复隐藏 bug：`value_to_json` 缺 unsigned 分支 → LIMIT/OFFSET 绑 NULL → sqlite
   code 20。集成测 `sqlite_roundtrip_via_bridge` 覆盖 DDL/insert + `db.table` + 参数化 `db.query`。
   双绿 8 passed。取舍：驱动安装放 `connect()` 内（调用方不可能忘记，DIP 根因位）。
+- **[P2]** commit `61d7c2b`：workspace（root + server）+ router（Go 6 测全移植）+ actor
+  （`JsActor::new(impl Fn() -> Bridge + Send)`——Bridge !Send 不可搬预构实例，改为线程内工厂构造；
+  actor 跨线程往返在多线程 runtime 下实测通过，P5 模式已验证）+ axum fallback 全链路
+  （200/404/500 信封，raw TCP 端到端测）。取舍：dev 模式 resolve 出文件即读即执行
+  （per-request 读盘=免费热重载，对齐 Go）；HandlerStore 嵌入 map 留 P4。params 键对齐 Go
+  （仅 sub/feature/entity）。TDD 偏差说明：router/actor 严格 RED→GREEN；axum 装配层系实现与测试
+  同批写入（E2E 真实 HTTP 覆盖 200/404/500），未先观 RED。
 - …（后续每 phase 追加一行）
