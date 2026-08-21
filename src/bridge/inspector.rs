@@ -62,7 +62,7 @@ async fn session_loop(inspector: Rc<JsRuntimeInspector>, ws: tokio_tungstenite::
     let pump = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_tx
-                .send(tokio_tungstenite::tungstenite::Message::Text(msg))
+                .send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
                 .await
                 .is_err()
             {
@@ -75,7 +75,7 @@ async fn session_loop(inspector: Rc<JsRuntimeInspector>, ws: tokio_tungstenite::
     while let Some(Ok(msg)) = ws_rx.next().await {
         match msg {
             tokio_tungstenite::tungstenite::Message::Text(t) => {
-                sess.dispatch(t);
+                sess.dispatch(t.to_string());
             }
             tokio_tungstenite::tungstenite::Message::Close(_) => break,
             _ => continue,

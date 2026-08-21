@@ -49,7 +49,7 @@ impl SqlxAccessor {
 }
 
 /// 将单个 JSON 值绑定到 sqlx 语句（按类型选择可 Encode 的具体类型）。
-fn bind_value<'q>(q: Query<'q, Any, AnyArguments<'q>>, v: &Value) -> Query<'q, Any, AnyArguments<'q>> {
+fn bind_value<'q>(q: Query<'q, Any, AnyArguments>, v: &Value) -> Query<'q, Any, AnyArguments> {
     match v {
         Value::Null => q.bind(None::<String>),
         Value::Bool(b) => q.bind(*b),
@@ -114,7 +114,7 @@ fn column_json(row: &sqlx::any::AnyRow, ordinal: usize) -> Option<Value> {
 #[async_trait]
 impl DataAccessor for SqlxAccessor {
     async fn query_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<Vec<JsRow>> {
-        let mut q: Query<'_, Any, AnyArguments<'_>> = sqlx::query(sql);
+        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
         }
@@ -126,7 +126,7 @@ impl DataAccessor for SqlxAccessor {
     }
 
     async fn exec_with_params(&self, sql: &str, params: &[Value]) -> BridgeResult<i64> {
-        let mut q: Query<'_, Any, AnyArguments<'_>> = sqlx::query(sql);
+        let mut q: Query<'_, Any, AnyArguments> = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in params {
             q = bind_value(q, p);
         }

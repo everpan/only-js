@@ -5,7 +5,7 @@
 //! Duration 以字符串存储（"5s"/"500ms"），使用方解析；Go 的裸数字纳秒形式不支持（ponytail: 需要时再补）。
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -160,6 +160,7 @@ fn merge_yaml(base: Value, over: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     struct TempDir(PathBuf);
     fn dir(files: &[(&str, &str)]) -> TempDir {

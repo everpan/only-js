@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
-use sea_query::{Alias, Expr, LikeExpr, Order, Query, SimpleExpr, SqliteQueryBuilder, Value as Qv};
+use sea_query::{Alias, Expr, ExprTrait, LikeExpr, Order, Query, SimpleExpr, SqliteQueryBuilder, Value as Qv};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -100,7 +100,7 @@ fn to_qv(v: &Value) -> Qv {
 
 fn build_expr(col: &str, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsErrorBox> {
     let c = Expr::col(Alias::new(col));
-    let rhs = |v: &Value| Expr::val(to_qv(v)).into();
+    let rhs = |v: &Value| Expr::val(to_qv(v));
     Ok(match op {
         Op::Eq => c.eq(rhs(val.as_ref().unwrap_or(&Value::Null))),
         Op::Ne => c.ne(rhs(val.as_ref().unwrap_or(&Value::Null))),
@@ -113,7 +113,7 @@ fn build_expr(col: &str, op: Op, val: &Option<Value>) -> Result<SimpleExpr, JsEr
                 .as_ref()
                 .and_then(|v| v.as_array())
                 .ok_or_else(|| JsErrorBox::generic("in needs array value"))?;
-            let vals: Vec<SimpleExpr> = arr.iter().map(|v| rhs(v)).collect();
+            let vals: Vec<Expr> = arr.iter().map(|v| rhs(v)).collect();
             c.is_in(vals)
         }
         Op::Like => {
@@ -186,7 +186,7 @@ pub async fn op_db_query_build(
         q.order_by(Alias::new(&o.field), dir);
     }
 
-    let limit = req.limit.unwrap_or(LIMIT_DEFAULT).min(LIMIT_MAX);
+    let limit = Ord::min(req.limit.unwrap_or(LIMIT_DEFAULT), LIMIT_MAX);
     q.limit(limit as u64);
     if let Some(off) = req.offset {
         q.offset(off as u64);
