@@ -76,7 +76,7 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
 | 3 | config 层 | 高 | ✅ done `1ba0d72` | — | 小 |
 | 4 | Server 生命周期 | 高 | ✅ done `8f27a32` | P3+P4-glue | 中（watchdog 408 + devserver 装配 + 冒烟全通） |
 | 5 | WebSocket 帧循环 | 中 | ✅ done `a99a976` | P2 | 大（5a echo 链路验证 + 5b 三任务流水线，一次通过） |
-| 6 | 性能优化 | 高 | 🟢 | — | 小（多数已实现） |
+| 6 | 性能优化 | 高 | ✅ done（2026-08-21 核实：无需改动，见 §6） | — | 0（代码缓存 API 对外不可达；fetch signal Go 亦无） |
 
 ### 2.1 Phase 0 — ASCII 校验 / build 绿（🟢 trivial）
 
@@ -124,7 +124,7 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
 **改动：**
 1. `server/` crate：`router.rs`（Resolve 移植）+ `actor.rs`（JS 线程 + mpsc/oneshot 桥）+ `lib.rs`（Server/handle）。
 2. `handle`：resolve → 经 actor 执行 `Bridge::run_named` → 回写 `capture.status`/`headers`/`body`。
-3. 信封语义对齐：404（无 handler）、compile-error；**408 超时信封随 P4 watchdog 接入**。
+3. 信封语义对齐：404（无 handler）、compile-error；408 超时信封（P4 watchdog 已接入）。
 
 ### 2.4 Phase 3 — config 层（🟢 小）
 
@@ -296,4 +296,10 @@ P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
   后退出（修复了裸 drop 导致的 TCP RST）。根 crate 侧：`op_ws_send/op_ws_close` + bootstrap `ws`
   全局（HTTP 路径不读 ws 字段 = Go nil 连接 no-op）。双绿 root 19 + server 22。TDD 偏差说明：
   run_ws/ws 全局严格 RED→GREEN；js_route 帧循环实现与测试同批写入（但测试当场抓出 RST bug 并修复）。
+- **[P6]** 结论：**零改动收尾**。① `execute_script_with_cache` 存在（jsrealm.rs:493）但**对外不可达**——
+  接收者 `JsRealm` 为 `pub(crate)`（runtime/mod.rs:25）、`JsRuntime::main_realm()` 亦 `pub(crate)`
+  （jsruntime.rs:1417），embedder 拿不到 realm 实例；唯一公开缓存钩子
+  `set_eval_context_code_cache_cbs` 只覆盖 `op_eval_context` 不覆盖 `execute_script`。计划「换
+  with_cache 版」的前提证伪，handler 复跑提速由 runtime 池化（已实现且测试覆盖）承担。
+  ② fetch signal/AbortController：Go 版同样没有（计划原文「同 Go 版限制」），parity 即完成，不扩。
 - …（后续每 phase 追加一行）
