@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use deno_core::{OpState, op2};
 use deno_error::JsErrorBox;
-use sea_query::{Alias, Expr, LikeExpr, Order, PostgresQueryBuilder, Query, SimpleExpr, Value as Qv};
+use sea_query::{Alias, Expr, LikeExpr, Order, Query, SimpleExpr, SqliteQueryBuilder, Value as Qv};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -192,7 +192,7 @@ pub async fn op_db_query_build(
         q.offset(off as u64);
     }
 
-    let (sql, values) = q.build(PostgresQueryBuilder);
+    let (sql, values) = q.build(SqliteQueryBuilder);
     let params: Vec<Value> = values
         .into_iter()
         .map(|v| value_to_json(&v))
@@ -217,6 +217,11 @@ fn value_to_json(v: &Qv) -> Result<Value, JsErrorBox> {
         Qv::SmallInt(Some(i)) => Value::from(*i),
         Qv::Int(Some(i)) => Value::from(*i),
         Qv::BigInt(Some(i)) => Value::from(*i),
+        // sea-query 将 LIMIT/OFFSET 渲染为 unsigned 绑定参数，缺失会退化为 NULL 绑定。
+        Qv::TinyUnsigned(Some(i)) => Value::from(*i as i64),
+        Qv::SmallUnsigned(Some(i)) => Value::from(*i as i64),
+        Qv::Unsigned(Some(i)) => Value::from(*i as i64),
+        Qv::BigUnsigned(Some(i)) => Value::from(*i as i64),
         Qv::Float(Some(f)) => num(*f as f64),
         Qv::Double(Some(f)) => num(*f),
         Qv::String(Some(s)) => Value::String(s.to_string()),

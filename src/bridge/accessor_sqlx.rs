@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::any::{Any, AnyArguments};
-use sqlx::pool::Pool;
+use sqlx::pool::{Pool, PoolOptions};
 use sqlx::query::Query;
 use sqlx::{Column, Row};
 
@@ -22,8 +22,16 @@ pub struct SqlxAccessor {
 
 impl SqlxAccessor {
     /// 从连接串构池（sqlite:///path、postgres://..、mysql://..）。
+    /// Any 驱动须先安装（幂等，调用方无感知）；sqlite 每连接独立库（尤其 `:memory:`），
+    /// 单连接亦对齐 Go 的 `SetMaxOpenConns(1)` 写锁语义。
     pub async fn connect(url: &str) -> BridgeResult<Self> {
-        let pool = Pool::<Any>::connect(url)
+        sqlx::any::install_default_drivers();
+        let mut opts = PoolOptions::<Any>::new();
+        if url.starts_with("sqlite") {
+            opts = opts.max_connections(1);
+        }
+        let pool = opts
+            .connect(url)
             .await
             .map_err(|e| format!("sqlx connect: {e}"))?;
         Ok(Self { pool })
@@ -133,10 +141,64 @@ impl DataAccessor for SqlxAccessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::{Bridge, InMemoryKV, SchemaRegistry};
+    use serde_json::json;
 
     // 仅类型/构造检查（不连真实库）；保证 SqlxAccessor 满足 DataAccessor trait。
     fn _assert_impl() {
         fn takes<T: DataAccessor>() {}
         takes::<SqlxAccessor>();
+    }
+
+    // P1 集成测：真实 sqlite 落库 → 经 Bridge 的 db.table / db.query 读回（LSP 替换 fake）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_roundtrip_via_bridge() {
+        let db = SqlxAccessor::arc("sqlite::memory:")
+            .await
+            .expect("connect must install drivers and pin sqlite pool");
+        db.exec_with_params(
+            "create table user (id integer primary key, name text, age integer)",
+            &[],
+        )
+        .await
+        .unwrap();
+        db.exec_with_params(
+            "insert into user (name, age) values (?, ?)",
+            &[json!("ever"), json!(18)],
+        )
+        .await
+        .unwrap();
+
+        let registry = SchemaRegistry::new().table("user", Some("id"), &["id", "name", "age"]);
+        let b = Bridge::with_opts(db, Arc::new(InMemoryKV::new()), registry, false);
+
+        // 结构化查询构造器（sea-query → 真实 sqlite，占位符须为 sqlite 方言）。
+        let cap = b
+            .run(
+                r#"
+                db.table("user").select(["id","name"]).where({field:"id",op:"eq",value:1})
+                  .limit(10).all()
+                  .then((rows) => json.ok({ rows }))
+                  .catch((e) => json.fail(500, String(e)));
+                "#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "builder query failed: {v}");
+        assert_eq!(v["data"]["rows"], json!([{"id": 1, "name": "ever"}]));
+
+        // 原始参数化 SQL（? 占位）。
+        let cap = b
+            .run(
+                r#"db.query("select name from user where age = ?", [18])
+                    .then((rows) => json.ok({ rows }))
+                    .catch((e) => json.fail(500, String(e)));"#,
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["code"], 0, "raw query failed: {v}");
+        assert_eq!(v["data"]["rows"], json!([{"name": "ever"}]));
     }
 }

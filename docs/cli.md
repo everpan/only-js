@@ -15,7 +15,7 @@
 Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.rs` 为默认 bin，
 `src/lib.rs` 暴露 `bridge` 模块）。**无 `crates/`、`build-deps/` 目录**（下文各处若再出现需纠正）。
 
-- `cargo build` 通过；`cargo test --release --lib` **7 passed, 0 failed**。
+- `cargo build` 通过；**2026-08-21 复验：`cargo test --lib`（debug）与 `cargo test --release --lib` 双绿，各 7 passed, 0 failed**。
 - 核心链路已在 Go 参考（`~/git/golang/mdm-base/internal/bridge`）对齐处实现：
   - `runtime.rs` — RuntimePool：复用 JsRuntime，bootstrap 只编译一次，后续请求仅执行 handler 源码。
   - `query.rs` + `registry.rs` — sea-query 动态构建 SELECT，标识符走 SchemaRegistry 白名单，值参数化（SQL 注入根治点）。
@@ -23,33 +23,29 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
   - `fetch.rs` — reqwest 实现 fetch，带本地 HTTP 全链路测试。
   - `inspector.rs` — 基于 deno_core 内置 inspector 的 DevTools WS 桥。
   - `loader.rs` — HandlerStore：FS 热重载（notify）+ 嵌入 map。
-  - `json.rs` / `envelope.rs` — 单遍序列化信封。
+  - `http.rs` — 请求上下文 RequestInfo（method/params/query/headers/body，移植 Go http.go，server 层填充）。
+  - `log.rs` / `json.rs` / `envelope.rs` — 日志绑定、fast JSON op、单遍序列化信封。
 
-### 1.2 已知缺陷（Phase 0 必须修）
+### 1.2 已知缺陷 —— 已清零（P0 完成于 commit `46a8eb8`）
 
-**`cargo test`（debug 配置）当前 5 个测试全挂**，根因单一：
-
-> `Extension code must be 7-bit ASCII: ext:bridge_ext/bootstrap.js (found 由侧为文本传入…)`
-
-deno_core 0.409 对扩展源码做 7-bit ASCII 校验，**debug profile 严格、release profile 放行**
-（故 release 测试能过）。`bootstrap.js` 内的中文注释触发了校验。
-
-修复方式（二选一，推荐 A）：
-- **A（推荐）：删除 `bootstrap.js` 中的中文注释**，改英文或拼音缩写，使 debug 也通过。
-- B：在 `bridge_ext` 里加 build-time 断言显式声明「release 允许非 ASCII」（仅掩盖，不推荐）。
-
-修完后应做到 **`cargo test`（debug）与 `cargo test --release`（release）双绿**。
+根因曾是 deno_core 0.409 对扩展源码的 7-bit ASCII 校验（debug 严格、release 放行），
+`bootstrap.js` 中文注释触发 debug 全挂。已改为 7-bit ASCII 并修复 debug 测试。
+**2026-08-21 复验：debug / release 双绿，各 7 passed。当前无已知缺陷。**
 
 ### 1.3 未移植清单（Go 有、Rust 无）
 
-| Go 实现 | Rust 现状 | 说明 |
+| Go 实现 | Rust 现状 | 说明（2026-08-21 逐条对照 Go 源码核实） |
 |---|---|---|
-| `redis.go` `Redis(name)` | 无 | 完整命令集（string/hash/list/set/zset/pubsub），需 redis crate |
-| `xorm.go` `XORM(name)` | 无 | 链式 Session API + 原生 SQL 兜底，需 xorm crate |
-| `ws.go` `ws.*` WebSocket | 无 | 帧循环 + 注册能力，**全案最大风险**（见 2.4） |
-| server 层超时熔断 | 无 | Go 用 `vm.Interrupt` 熔断死循环；deno_core 无直接等价 |
-| config 层 | 无 | Go `internal/config`；需 serde_yaml |
-| router 层 | 无 | Go `internal/router` 的 `{METHOD}.js` 路径解析 |
+| `redis.go` `Redis(name)` | 无 | string/hash/list/set/zset；pubsub **仅 publish、无 subscribe**；名字未注册返回 undefined |
+| `xorm.go` `XORM(name)` | 无 | 链式 `table/from/where/limit/orderBy`；终结 `find/get/count/insert/update/delete`；raw `query/exec`；engine 级 `ping/stats/isTableExist/dbMetas/tableInfo`；裸 `xorm` = default；实例按名缓存 |
+| `ws.go` `ws.*` WebSocket | 无 | **仅 `send(data)`/`close()` 两个 op**；三协程 reader/processor/writer，msgChan/respChan 各 cap 64；**每连接独占一个 VM**（不进 HTTP 池），handler 预编译逐帧复跑；每帧默认 10s 超时 |
+| server 层超时熔断 | 无 | Go 用 `vm.Interrupt` → **408** "handler execution timed out"，超时会话丢弃不回池。Rust 路径：`v8::Isolate::terminate_execution`（v8-150.4.0 `isolate.rs:993`，V8 允许跨线程调用）——deno_core 无包装，需 unsafe 存 isolate 指针 |
+| config 层 | 无 | `Config{Server, DB: map, Redis: map}`，`ServerConfig{Addr,BaseDir,Timeout,PoolSize,HMR}`；`--config/--env/--generate-config` |
+| router 层 | 无 | `Resolve(method,path)`：最少 4 段 `{mode}-{version}/{sub}/{feature}/{entity}`，多余段进 Rest；文件名 `ToUpper(method)+".js"`（核实无误） |
+| `internal/hot`（HMR/ProgramCache） | 部分有 | loader.rs 已覆盖 FS 热重载；ProgramCache ≈ `execute_script_with_cache`（P6） |
+| demo DB 种子（default 实例） | 无 | Go main.go 仅为 default 播种演示数据 |
+
+另：Go `internal/features` 仅测试沙箱、`internal/observ` 无 .go 文件——**均不移植**。
 
 ### 1.4 结构参考（Go 侧，勿照搬目录）
 
@@ -60,6 +56,9 @@ deno_core 0.409 对扩展源码做 7-bit ASCII 校验，**debug profile 严格�
 ├── internal/server/   # axum/fiber server （待新建 server crate）
 ├── internal/router/   # 路径解析          （待移植）
 ├── internal/config/   # 配置              （待移植）
+├── internal/hot/      # HMR/ProgramCache  （loader.rs 已覆盖大半）
+├── internal/features/ # 仅测试沙箱        （不移植）
+├── internal/observ/   # 空目录            （不移植）
 └── cmd/devserver/     # 装配 + 生命周期   （待移植）
 ```
 
@@ -72,7 +71,7 @@ deno_core 0.409 对扩展源码做 7-bit ASCII 校验，**debug profile 严格�
 | Phase | 内容 | 可行性 | 风险 | 前置 | 关键工作量 |
 |---|---|---|---|---|---|
 | 0 | ASCII 校验 / build 绿 | 高 | 🟢 | — | trivial |
-| 1 | sqlx 接入 | 中高 | 🟡 | P0 | 小（`accessor_sqlx.rs` 已存在） |
+| 1 | sqlx 接入 | 高 | 🟢 | P0 | 小（`accessor_sqlx.rs` 已存在；原判 🟡 基于已证伪的 set_handler 前提） |
 | 2 | Server 层（axum） | 高 | 🟡 | P1 | 中（新 crate） |
 | 3 | config 层 | 高 | 🟢 | — | 小 |
 | 4 | Server 生命周期 | 高 | 🟡 | P3+P4-glue | 中 |
@@ -85,54 +84,84 @@ deno_core 0.409 对扩展源码做 7-bit ASCII 校验，**debug profile 严格�
 **改动：** 删 `bootstrap.js` 中文注释；跑 `cargo test` 与 `cargo test --release` 确认双绿。
 **验证：** 两配置均 7 passed。
 
-### 2.2 Phase 1 — sqlx 接入（🟡 中）
+### 2.2 Phase 1 — sqlx 接入（🟢 小；原判 🟡 基于错误前提）
 
 **目标：** 把 `SqlxAccessor`（`src/bridge/accessor_sqlx.rs`，**已实现**）接入 `Bridge`，替换内存 fake。
 
-**关键事实与风险：**
-- `accessor_sqlx.rs` 已满足 `DataAccessor` trait（`query_with_params`/`exec_with_params`，Any 驱动）。
-- **sqlx 需注册 runtime handler**：连接前调用 `sqlx::runtime::set_handler(&sqlx::runtime::Handler::tokio())`
-  （feature `runtime-tokio` 已开）。deno_core 跑 current_thread tokio，`Handler::tokio()` 兼容。
-  ⚠️ 此调用必须在**任何 `Pool::connect` 之前**全局调用一次（main 入口或 lib init）。
-- 通过 `Bridge::set_db_accessors`（已存在，注释「须在首次 checkout 之前调用」）注入命名实例。
+**核实更正（2026-08-21，对照锁定版本 sqlx 0.8.6 源码）：**
+- ❌ 原稿「连接前须调 `sqlx::runtime::set_handler(&Handler::tokio())`」**证伪**——0.8.6 无
+  `runtime` 模块/`set_handler`/`Handler`（grep 全源码无命中）。0.8 的 runtime 选择纯靠编译期
+  feature（`runtime-tokio` 已开于根 Cargo.toml），**无需任何注册调用，原第 1 步删除**。
+- ✅ 真实前置约束是 **`sqlx::any::install_default_drivers()`**（`any/mod.rs:35`）：
+  AnyPool 首次连接前调用一次，激活已编译进来的 sqlite/mysql/postgres 驱动。
+- `Bridge::set_db_accessors`（`mod.rs:170`）经 `Arc::get_mut` 注入，**须在首次 checkout 之前**（现注释已写明）。
+- Go 语义对齐（核实）：无 `default` 键时取 map 第一个实例作 default；Go 侧**只注册 sqlite 驱动**
+  （modernc.org/sqlite，纯 Go）——「扩 pg/mysql」超出对齐范围，sqlx Any 特性保留即可、不投入。
 
-**改动：**
-1. main 入口调 `sqlx::runtime::set_handler(...)`。
-2. 用 `SqlxAccessor::arc(dsn)` 构造 `Arc<dyn DataAccessor>`，`set_db_accessors` 注入 `default`（及命名实例）。
-3. 补一个连 sqlite memory/temp 的集成测试（`#[tokio::test]`），验证 `db.query`/`db.table` 真实落库。
+**改动（可立即执行）：**
+1. main/tests 入口调 `sqlx::any::install_default_drivers()`。
+2. `SqlxAccessor::arc("sqlite://...")` 构造 `Arc<dyn DataAccessor>`，`set_db_accessors` 注入。
+3. 补 sqlite 落库集成测试（`#[tokio::test]`）：建表 → `db.exec` 插入 → `db.table(...)` 读回断言 +
+   绑定参数 + 未知表拒绝。
 
 ### 2.3 Phase 2 — Server 层（axum，🟡 中，新 crate）
 
 **目标：** 新建 `server/` crate，实现 `GET/POST/.../*.js` 路由解析 + 统一信封输出。
 
-**关键事实与风险：**
-- **新 crate = 独立 `server/Cargo.toml`**，`[dependencies]` 依赖 `mdm-base-rust`（workspace member）。
-- 工作区 edition 2024；axum 0.8 支持 edition 2024（确认版本兼容后再定）。
-- **HTTP 路径无 `!Send` 风险**：`Bridge`/`JsRuntime` 在单个请求 task 内创建+使用+丢弃，不跨线程。
-  这与 Phase 5（WS 跨帧复用同一 runtime）有本质区别——**Phase 2 安全，Phase 5 是难点**。
-- router 逻辑直接移植 Go `internal/router/Resolve`（`{mode}-{version}/{sub}/{feature}/{entity}/{METHOD}.js`）。
+**关键事实与风险（2026-08-21 修正）：**
+- **新 crate = 独立 `server/Cargo.toml`**，依赖 `mdm-base-rust`（workspace member）。axum 0.8 可被
+  edition 2024 crate 依赖（edition 按 crate 各自生效）；开工第一步 `cargo add axum` 冒烟定版。
+- ⚠️ **原稿「HTTP 路径无 !Send 风险」证伪**：`Bridge` 持 `RefCell` 池（→ !Sync），且 `run_with` 的
+  future 跨 await 持有 `&mut JsRuntime`（!Send）→ **axum handler future 必须 Send，直接 `.await` 编译不过**。
+- ✅ **正确架构（同时是 P5 的地基）——JS actor 线程**：N 个专用 OS 线程，各跑一个
+  `current_thread` tokio runtime 并持有 `Bridge`；axum handler 只做
+  `mpsc::send((RequestInfo, oneshot::Sender))` → `await oneshot` 收 `Capture`——future 只含
+  channel，天然 Send。线程数 = Go `ServerConfig.PoolSize` 的等价物。
+- router 直接移植 Go `Resolve`（已核实：最少 4 段、`{mode}-{version}/{sub}/{feature}/{entity}`、
+  文件名 `ToUpper(method)+".js"`、多余段进 Rest）。Go server 是 fiber v3 catch-all `All("/*")`，
+  axum 用 `fallback` 路由等价。
 
 **改动：**
-1. `server/` crate + `src/lib.rs`（`Server` 结构、`Router` 解析、`handle`）。
-2. `handle`：resolve → `Bridge::run_named(method)` → 写 `capture.status`/`headers`/`body`。
-3. 移植 Go 的 404/compile-error 信封语义。
+1. `server/` crate：`router.rs`（Resolve 移植）+ `actor.rs`（JS 线程 + mpsc/oneshot 桥）+ `lib.rs`（Server/handle）。
+2. `handle`：resolve → 经 actor 执行 `Bridge::run_named` → 回写 `capture.status`/`headers`/`body`。
+3. 信封语义对齐：404（无 handler）、compile-error；**408 超时信封随 P4 watchdog 接入**。
 
 ### 2.4 Phase 3 — config 层（🟢 小）
 
-**目标：** 移植 Go `internal/config`（`Config`/`ServerConfig`/`DBConfig`/`RedisConfig`）。
-**技术选型：** `serde_yaml` 0.9（已 deprecated，功能可用；若团队抵触可换 `serde_yml` fork）。
-**风险：** deprecated crate 无安全更新——仅内部配置解析，可接受；在 `Cargo.toml` 注释标注。
+**目标：** 移植 Go `internal/config`（结构已核实）：
+- `Config{Server, DB: map<name, DBConfig{DSN}>, Redis: map<name, RedisConfig{Addr,Password,DB}>}`；
+  `ServerConfig{Addr, BaseDir, Timeout, PoolSize, HMR}`。
+- ⚠️ **「env 覆盖」语义修正（核实）**：不是 OS 环境变量，而是 **`cfg.<env>.yml` 文件叠加**
+  （`Default()` ← `cfg.yml` ← `cfg.<env>.yml`；env 取自 `--env` 参数或 `APP_ENV`）。
+- 默认/回落：`BaseDir` 默认且空值回落 `"routes"`；HMR Root 回落 BaseDir；缺默认 cfg.yml 静默用默认值，
+  显式 `--config` 指向缺失文件则报错。
+**技术选型：** `serde_yaml` 0.9（deprecated 但功能可用，Go 侧用 go.yaml.in/yaml/v3）；`Cargo.toml` 注释标注。
+**风险：** 低。Go `config_test.go` 共 25 例，移植主干即可（见 §5）。
 
 ### 2.5 Phase 4 — Server 生命周期（🟡 中）
 
-**目标：** 装配 config → sqlx pool → Bridge → server，含命名 DB 实例构建。
-**改动：** main 读 config → 每个 `db.<name>` 开一个 sqlx `Pool<Any>` → `SqlxAccessor::from_pool` →
-`Bridge::set_db_accessors` → `Server::new`。
-**风险：** sqlx Any 多驱动（mysql/postgres/sqlite）的连接串格式差异；先只做 sqlite 跑通，再扩。
+**目标：** 装配 config → sqlx pool → Bridge → server。对齐 Go `buildServer`（已核实流程）：
+parseArgs（`--config/--env/--generate-config`）→ `config.Load` → 逐 `db.<name>` 开库
+【Go 对 sqlite `SetMaxOpenConns(1)`】→ 仅 default 播种 demo 数据 → HMR（可选）→
+`NewSessionPool(PoolSize)` → 逐名 redis client → `server.New`。
+
+**改动：**
+1. main 读 config → 逐 `db.<name>` 开 sqlx `Pool<Any>`（sqlite 建 pool 时 `max_connections(1)`
+   对齐 Go 写锁语义）→ `SqlxAccessor::from_pool` → `set_db_accessors`（无 default 键时取第一个，
+   对齐 Go 回落）。
+2. **超时熔断**：每请求起 watchdog（`cfg.Server.Timeout`），到期经 actor 存的 isolate 裸指针调
+   `v8::Isolate::terminate_execution()`（V8 允许跨线程），该 runtime **不归还池**，回 408 信封
+   对齐 Go。unsafe 集中在 actor.rs 单点、注明 SAFETY。
+3. JS actor 线程数 = `cfg.Server.PoolSize`。
+
+**风险：** watchdog 的 unsafe isolate 指针是唯一硬点；先不接也不阻塞联调（死循环 handler 占死一个
+actor，新请求会新建 runtime，劣化但不死锁）——**上线前必须有**。
 
 ### 2.6 Phase 5 — WebSocket 帧循环（🔴 高，全案最大风险）
 
-**目标：** 移植 Go `ws.go` 的 `ws.*` 绑定 + 三协程帧循环。
+**目标：** 移植 Go `ws.go`（已核实）：`ws.*` 仅 `send(data)`（5s 写超时）/`close()` 两个 op；
+三协程 reader/processor/writer，msgChan/respChan 各 **cap 64**；**每连接独占一个 VM**（不进
+HTTP SessionPool），handler 预编译、逐帧在同一 VM 复跑；每帧默认 10s 超时熔断。
 
 **为什么是最大风险 —— 核心矛盾：**
 - deno_core 的 `JsRuntime` 是 **`!Send`**（不可跨线程）且**绑定 current_thread tokio**（见 `runtime.rs` 注释）。
@@ -141,13 +170,13 @@ deno_core 0.409 对扩展源码做 7-bit ASCII 校验，**debug profile 严格�
   **必须把整条帧循环钉在单个 current_thread 句柄内**（`tokio::Runtime::block_in_place` 或
   专用 `Builder::new_current_thread().build()` + 该 handle 上 `spawn`）。
 
-**推荐架构（重构自 Go 三协程）：**
-- 每个 WS 连接一个**当前线程的 runtime 工作单元**（从 RuntimePool checkout 一个 JsRuntime，绑定到该连接的生命周期）。
-- 用 3 个 `tokio::task`（在**同一个 current_thread handle** 上 spawn）：Reader（读帧 → mpsc）/
-  Processor（`Bridge::run` → 出响应 → mpsc）/ Writer（消费响应 → `Upgrade` 写回）。
-- msgChan/respChan 各 `mpsc::bounded(64)` 提供背压。
-- ⚠️ **不要**让 axum 的 WS handler 直接 `await` 一个可能跨帧持有 JsRuntime 的 future——
-  必须用上面的"钉死在 single-thread handle"模式。
+**推荐架构（重构自 Go 三协程，复用 P2 actor）：**
+- **复用 P2 的 JS actor 线程**：每 WS 连接在某个 actor 线程上 checkout 一个 runtime 绑定连接
+  生命周期（对齐 Go「每连接独立 VM」），帧循环全部钉在该 actor 的 current_thread handle 上。
+- actor 线程内 3 个 task：Reader（axum socket 读帧 → msgChan，cap 64）/ Processor（逐帧
+  `run_to_completion` 复跑 handler → respChan，cap 64）/ Writer（respChan → socket 写回）。
+- axum 侧 handler 只搬字节与 channel（future 天然 Send）。
+- ⚠️ **不要**让 axum 的 WS handler 直接 `await` 跨帧持有 JsRuntime 的 future——一律走 actor 通道。
 
 **建议分两步降低风险：**
 1. **5a（MVP）：** 先做一个最小 WS echo（不执行 JS handler，仅透传帧），先打通 axum+upgrade+single-thread pin 这条最危险的链路。
@@ -159,40 +188,42 @@ deno_core 0.409 对扩展源码做 7-bit ASCII 校验，**debug profile 严格�
 **目标：** 扩 fetch 能力（signal/AbortController）、代码缓存。
 **关键事实：** 池化复用（`runtime.rs`）、单遍信封序列化（`envelope.rs`）、`serde_v8` 规避（`json.rs` fast op）
 **均已实现**。fetch 已可用（`fetch.rs`），仅缺 signal/AbortController（同 Go 版限制）。
-**改动：** fetch 加 optional `signal`；handler 源码走 `execute_script_with_cache`（V8 代码缓存）。
+**改动：** fetch 加 optional `signal`；`run_to_completion` 的 `execute_script` 换
+`execute_script_with_cache`（**已核实存在**：deno_core 0.409 `runtime/jsrealm.rs:493`，经 realm 调用；
+当前 runtime.rs 只用了无缓存版 `jsruntime.rs:2020`）。
 
 ---
 
 ## 3. 扩充后的实施顺序（依赖图）
 
 ```
-P0 (build 绿)
+P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
   │
-  ├─→ P1 (sqlx) ──→ P2 (axum server) ──→ P5a (WS 最小链路) ──→ P5b (WS JS 帧循环)
-  │                                                 │
-  └─→ P3 (config) ──→ P4 (生命周期装配) ──────────────┘
-                        │
-                        └──────────────────────→ P6 (perf, 可并行)
+  ├─→ P1 (sqlx) ──→ P2 (axum server + JS actor 线程) ──→ P5a (WS 最小链路) ──→ P5b (WS JS 帧循环)
+  │                        ↑
+  └─→ P3 (config) ──→ P4 （生命周期装配 + 408 熔断）
+                                          │
+                                          └──────→ P6 (perf, 可与任意阶段并行)
 ```
 
-- **关键路径：** P0 → P1 → P2 → P5a → P5b。
-- P3/P4 可早开始（不依赖 P2）。
-- P6 与 P5b 后段可并行。
-- **Phase 5 是成败关键**：建议在 P2 一过就立即做 P5a 探路，把 `!Send` pin 风险在早期暴露，
-  而非留到最后。
+- **关键路径：** P1 → P2 → P4 → P5a → P5b；P3 与 P1/P2 并行，P6 随时可插。
+- **P2 的 JS actor 线程模式是全案地基**：它同时化解 HTTP 的 Send 约束（本轮核实：RefCell 池 →
+  Bridge !Sync，直接 await 编译不过）与 P5 的跨帧钉死。P2 做完，P5 风险从「未知架构」降为
+  「填充逻辑」——P5a 探路仍应紧跟 P2 验证 channel 化的 WS 升级链路。
 
 ---
 
 ## 4. 风险与对策
 
-| 风险 | 影响 | 对策 |
-|---|---|---|
-| deno_core `!Send` + axum 多线程 WS | V8 isolate 跨线程崩 | P5a 先验证 single-thread pin 模式；帧循环钉在单个 current_thread handle |
-| sqlx runtime handler 时序 | connect 失败/panic | main 入口尽早 `set_handler`，连库前 |
-| edition 2024 × axum/依赖兼容 | 编译失败 | P2 前先 `cargo add` 冒烟，确认版本 |
-| serde_yaml deprecated | 无安全更新 | 内部配置解析，可接受；注释标注，预留换 `serde_yml` |
-| 命名 DB 多驱动连接串 | 仅 sqlite 跑通 | 先 sqlite memory，再扩 pg/mysql |
-| debug/release ASCII 行为不一致 | 测试口径错乱 | 统一删中文注释，双配置都绿 |
+| 风险 | 影响 | 对策 | 状态 |
+|---|---|---|---|
+| axum handler future 必须 Send（Bridge !Sync / JsRuntime !Send） | 直接 `.await` 编译不过；硬绕则 isolate 跨线程崩 | P2 建 JS actor 线程 + channel 桥，P5 复用同套 | 架构已定 |
+| sqlx Any 首连前未装驱动 | `AnyPool::connect` 报 no installed driver | 连接前调 `sqlx::any::install_default_drivers()`（0.8.6 `any/mod.rs:35`） | 已知解法 |
+| 死循环 handler 无熔断 | 占死一个 actor 线程 | P4 watchdog + `v8::Isolate::terminate_execution` + 408 + runtime 不回池 | unsafe 单点 |
+| edition 2024 × axum | 编译失败 | P2 第一步 `cargo add axum` 冒烟（edition 按 crate 生效，预期无碍） | 低 |
+| serde_yaml deprecated | 无安全更新 | 内部配置解析，可接受；`Cargo.toml` 注释标注 | 低 |
+| ~~sqlx runtime handler 时序~~ | — | **已证伪**：sqlx 0.8.6 无此 API，feature 编译期已定 | 移除 |
+| ~~debug/release ASCII 不一致~~ | — | P0 已修（`46a8eb8`），双绿 2026-08-21 复验 | 移除 |
 
 ---
 
@@ -200,12 +231,16 @@ P0 (build 绿)
 
 每阶段补测试，目标覆盖 Go 侧已有断言：
 
-- **P0：** debug/release 双绿（回归现有 7 测）。
-- **P1：** sqlite 集成测（`db.query`/`db.table` 真实落库 + 绑定参数 + 未知表拒绝）。
-- **P2：** router 解析测（成功/缺文件/无版本段/段数不足/extra rest）——直接移植 Go `router_test.go`。
-- **P3：** config 加载测（默认值/env 覆盖/base_dir 回落）——移植 `config_test.go`。
-- **P5：** WS echo 测（连接→收发→关闭），验证帧循环不回主线程。
-- 端到端：`GET /crm-v1/user/profile/list` → 返回统一信封（对齐 Go `bridge_test.go`）。
+- **P0：** ✅ debug/release 双绿（7 测，2026-08-21 复验）。
+- **P1：** sqlite 集成测（建表 → `db.exec` 插入 → `db.table(...)` 读回 + 绑定参数 + 未知表拒绝）。
+- **P2：** router 解析测——移植 Go `router_test.go` 全 6 例（Success / MethodFileMissing /
+  NoVersionSegment / TooFewSegments / ExtraRestCaptured / ModuleHelper）+ actor 桥测
+  （发 RequestInfo → 回 Capture）。
+- **P3：** config 测——移植 `config_test.go` 主干（Defaults / **EnvOverlay=文件叠加** /
+  BaseDirEmpty 回落 / ExplicitConfig 缺失报错）。
+- **P4：** 熔断测：`while(true)` handler → 408 信封、runtime 不回池（池长不涨）。
+- **P5：** WS echo 测（连接→收发→关闭），验证帧循环钉在 actor 线程不回 axum 线程。
+- 端到端：`GET /crm-v1/user/profile/list` → 统一信封（对齐 Go `bridge_test.go`）。
 
 ---
 
@@ -214,4 +249,11 @@ P0 (build 绿)
 - **[P0]** commit `6d9166b` 之后：删 `bootstrap.js` 中文注释（改英文），根因 deno_core 0.409
   的 7-bit ASCII 校验 debug 严格、release 放行。取舍：放弃"release 允许中文"，改源头清 ASCII，
   避免 debug/release 行为分裂。`cargo test` 与 `--release` 均 7 passed。
+- **[复核 2026-08-21]** 全文结论逐条对照源码验证：① 双绿复验（debug/release 各 7 passed）；
+  ② **证伪** sqlx 0.8.6 需 `set_handler`（源码无此 API，真实约束为 `any::install_default_drivers`）；
+  ③ **证伪** P2「无 !Send 风险」（`RefCell` 池 → Bridge !Sync，须 JS actor 线程，P5 复用）；
+  ④ **修正**「env 覆盖」= `cfg.<env>.yml` 文件叠加而非 OS 环境变量；⑤ **确认** `execute_script_with_cache`
+  存在（deno_core 0.409 jsrealm.rs:493）、`v8::Isolate::terminate_execution` 存在（v8-150.4.0
+  isolate.rs:993）；⑥ Go 侧细节逐条核实（ws 仅 send/close、chan cap 64、每连接独占 VM、
+  408 熔断、SetMaxOpenConns(1)、仅 sqlite 驱动、router 4 段格式）。P1 风险 🟡→🟢，P2 架构改为 actor 线程。
 - …（后续每 phase 追加一行）
