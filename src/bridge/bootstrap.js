@@ -24,8 +24,8 @@ import {
 
 // ----- json: unified envelope + response headers -----
 globalThis.json = {
-  // data 由 JS 侧 JSON.stringify 为 JSON 文本传入，op 直接原样拼进信封，
-  // 避免 serde_v8 反序列化再 serde_json 序列化的双重开销。
+  // data is JSON.stringify'd on the JS side, so the op can splice it into the
+  // envelope verbatim, avoiding the serde_v8 deserialize + serde_json re-serialize cost.
   ok: (data) => op_json_ok(data === undefined ? "null" : JSON.stringify(data)),
   fail: (code, msg, data) =>
     op_json_fail(code | 0, String(msg), data === undefined ? null : data),
@@ -42,7 +42,8 @@ globalThis.http = new Proxy({}, {
 function logCall(level, msg, kv) {
   const fields = {};
   for (let i = 0; i + 1 < kv.length; i += 2) fields[String(kv[i])] = kv[i + 1];
-  // JS 侧一次性 JSON.stringify，直接把 JSON 字符串传给 Rust（避免 serde_v8 + to_string 双重序列化）。
+  // JSON.stringify once on the JS side, hand the JSON string straight to Rust
+  // (avoid double serialization via serde_v8 + to_string).
   op_log(level, String(msg), JSON.stringify(fields));
 }
 globalThis.log = {
