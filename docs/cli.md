@@ -74,7 +74,7 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
 | 1 | sqlx 接入 | 高 | ✅ done `7867852` | P0 | 小（实际改动比预估更小：`install_default_drivers` 进 connect + sqlite 方言 + unsigned 修复） |
 | 2 | Server 层（axum） | 高 | ✅ done `61d7c2b` | P1 | 中（实际三模块 router/actor/axum，actor 模式一次成型） |
 | 3 | config 层 | 高 | ✅ done `1ba0d72` | — | 小 |
-| 4 | Server 生命周期 | 高 | ✅ done（P4 commit 见 §6） | P3+P4-glue | 中（watchdog 408 + devserver 装配 + 冒烟全通） |
+| 4 | Server 生命周期 | 高 | ✅ done `8f27a32` | P3+P4-glue | 中（watchdog 408 + devserver 装配 + 冒烟全通） |
 | 5 | WebSocket 帧循环 | 中 | 🔴 | P2 | 大（见 2.4） |
 | 6 | 性能优化 | 高 | 🟢 | — | 小（多数已实现） |
 
