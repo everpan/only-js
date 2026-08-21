@@ -1,0 +1,13 @@
+[package]
+name = "mdm-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mdm-base-rust = { path = ".." }
+axum = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "sync"] }
+
+[dev-dependencies]
+serde_json = "1"

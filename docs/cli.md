@@ -71,7 +71,7 @@ Rust 端为 **单 crate `mdm-base-rust`**（根目录 `Cargo.toml`，`src/main.r
 | Phase | 内容 | 可行性 | 风险 | 前置 | 关键工作量 |
 |---|---|---|---|---|---|
 | 0 | ASCII 校验 / build 绿 | 高 | 🟢 | — | trivial |
-| 1 | sqlx 接入 | 高 | 🟢 | P0 | 小（`accessor_sqlx.rs` 已存在；原判 🟡 基于已证伪的 set_handler 前提） |
+| 1 | sqlx 接入 | 高 | ✅ done `7867852` | P0 | 小（实际改动比预估更小：`install_default_drivers` 进 connect + sqlite 方言 + unsigned 修复） |
 | 2 | Server 层（axum） | 高 | 🟡 | P1 | 中（新 crate） |
 | 3 | config 层 | 高 | 🟢 | — | 小 |
 | 4 | Server 生命周期 | 高 | 🟡 | P3+P4-glue | 中 |
@@ -256,4 +256,9 @@ P0 ✅ (46a8eb8, 双绿复验 2026-08-21)
   存在（deno_core 0.409 jsrealm.rs:493）、`v8::Isolate::terminate_execution` 存在（v8-150.4.0
   isolate.rs:993）；⑥ Go 侧细节逐条核实（ws 仅 send/close、chan cap 64、每连接独占 VM、
   408 熔断、SetMaxOpenConns(1)、仅 sqlite 驱动、router 4 段格式）。P1 风险 🟡→🟢，P2 架构改为 actor 线程。
+- **[P1]** commit `7867852`：`connect()` 内幂等安装 Any 驱动 + sqlite 单连接池（对齐 Go
+  `SetMaxOpenConns(1)`，`:memory:` 必需）；builder 换 `SqliteQueryBuilder`（真库不吃 `$1`）。
+  TDD 暴露并修复隐藏 bug：`value_to_json` 缺 unsigned 分支 → LIMIT/OFFSET 绑 NULL → sqlite
+  code 20。集成测 `sqlite_roundtrip_via_bridge` 覆盖 DDL/insert + `db.table` + 参数化 `db.query`。
+  双绿 8 passed。取舍：驱动安装放 `connect()` 内（调用方不可能忘记，DIP 根因位）。
 - …（后续每 phase 追加一行）
