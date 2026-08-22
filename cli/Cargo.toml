@@ -12,3 +12,4 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"]
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "json"] }
+serde_json = "1"

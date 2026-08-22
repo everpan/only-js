@@ -2203,6 +2203,7 @@ dependencies = [
  "mdm-server",
  "reqwest",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
 ]
