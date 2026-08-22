@@ -2,6 +2,7 @@
 
 pub mod actor;
 pub mod router;
+pub mod routes;
 pub mod ws;
 
 use std::collections::HashMap;
