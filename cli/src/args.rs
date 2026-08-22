@@ -40,10 +40,6 @@ pub fn parse(args: &[String]) -> Command {
                     _ => {}
                 }
             }
-            // 无任何标志时，默认 dev=true
-            if config.is_empty() && base.is_empty() && dir.is_empty() && !dev {
-                dev = true;
-            }
             let dir = if dir.is_empty() { if dev { "src".into() } else { "dist".into() } } else { dir };
             Command::Server(ServerArgs {
                 config: if config.is_empty() { "config.yaml".into() } else { config },
@@ -66,15 +62,18 @@ mod tests {
 
     #[test]
     fn parse_branches() {
-        // 无参 → None；server 默认值；显式覆盖；build 占位。
+        // 无参 → None；server 默认值（dev=false, dir=dist）；显式覆盖；build 占位。
         assert!(matches!(parse(&args(&[])), Command::None));
         let Command::Server(a) = parse(&args(&["server"])) else { panic!() };
         assert_eq!((a.config.as_str(), a.base.as_str(), a.dir.as_str(), a.dev),
-                   ("config.yaml", "/v1/api", "src", true));
+                   ("config.yaml", "/v1/api", "dist", false));
         let Command::Server(a) = parse(&args(&["server", "-c", "c.yaml", "-b", "/api",
                                                "-d", "dist"])) else { panic!() };
         assert_eq!((a.config.as_str(), a.base.as_str(), a.dir.as_str(), a.dev),
                    ("c.yaml", "/api", "dist", false));
+        let Command::Server(a) = parse(&args(&["server", "-b", "/api"])) else { panic!() };
+        assert_eq!((a.config.as_str(), a.base.as_str(), a.dir.as_str(), a.dev),
+                   ("config.yaml", "/api", "dist", false));
         let Command::Server(a) = parse(&args(&["server", "--dev", "-d", "x"])) else { panic!() };
         assert!(a.dev && a.dir == "x");
         assert!(matches!(parse(&args(&["build", "moduleA"])), Command::Build(_)));
