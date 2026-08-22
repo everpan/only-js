@@ -63,13 +63,13 @@ impl OjModuleLoader {
             return Err(format!("unsupported scheme: {specifier}"));
         }
         let ref_dir = referrer_dir(referrer)?;
-        if specifier.starts_with("./") || specifier.starts_with("../") {
-            let p = resolve_relative(&ref_dir, specifier, self.inner.ts)?;
-            versioned_specifier(&p)
+        let p = if specifier.starts_with("./") || specifier.starts_with("../") {
+            resolve_relative(&ref_dir, specifier, self.inner.ts)?
         } else {
-            let p = resolve_bare(specifier, &ref_dir, &self.inner.project_root)?;
-            versioned_specifier(&p)
-        }
+            resolve_bare(specifier, &ref_dir, &self.inner.project_root)?
+        };
+        ensure_within(&p, &self.inner.project_root)?;
+        versioned_specifier(&p)
     }
 
     /// load：剥 ?v= → 读盘（.ts 走缓存转译）→ CJS 则包装 → ModuleSource。
@@ -228,6 +228,19 @@ pub fn versioned_specifier(path: &Path) -> Result<ModuleSpecifier, String> {
     Ok(url)
 }
 
+/// project_root 钳制：解析结果 canonical 化后必须仍在 root 内。
+/// lexical `..` 归一化可组合出根外路径（specifier 来自项目文件，属纵深防御）。
+/// 双侧 canonical 化对齐符号链接（如 macOS 的 /var → /private/var），避免误伤。
+fn ensure_within(p: &Path, root: &Path) -> Result<(), String> {
+    let cp = std::fs::canonicalize(p).map_err(|e| format!("stat {}: {e}", p.display()))?;
+    let cr = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if cp.starts_with(&cr) {
+        Ok(())
+    } else {
+        Err(format!("module path {} escapes project root {}", p.display(), root.display()))
+    }
+}
+
 /// CJS 启发式：无 ESM 顶层语法且是 .js/.cjs（node_modules 包）。
 /// ponytail: 启发式覆盖主流简单包；误判时报错信息可定位（module is not defined）。
 pub fn looks_cjs(src: &str) -> bool {
@@ -340,6 +353,26 @@ mod tests {
         assert!(e.contains("node_modules"), "{e}");
         // 回溯：src/user/feat 深处也能找到根 node_modules。
         assert!(resolve_bare("escape-goat", &root.join("src/user/feat"), &root).is_ok());
+    }
+
+    #[test]
+    fn resolve_rejects_paths_escaping_project_root() {
+        // base 下 proj 是项目根；escape.js 在根外（不依赖 /etc 等系统文件）。
+        let base = fx(&[
+            ("escape.js", "export const e = 1;\n"),
+            ("proj/src/user/mod.js", "export const m = 1;\n"),
+        ]);
+        let root = base.join("proj");
+        let loader = OjModuleLoader {
+            inner: Arc::new(LoaderShared { project_root: root.clone(), ts: true }),
+        };
+        let referrer =
+            ModuleSpecifier::from_file_path(root.join("src/user/mod.js")).unwrap().to_string();
+        // 根内相对导入不受影响。
+        assert!(loader.resolve_inner("./mod.js", &referrer).is_ok());
+        // lexical `..` 越过项目根 → 钳制报错（而非解析成功）。
+        let e = loader.resolve_inner("../../../escape.js", &referrer).unwrap_err();
+        assert!(e.contains("escapes project root"), "{e}");
     }
 
     #[test]
