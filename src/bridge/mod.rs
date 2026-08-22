@@ -11,6 +11,7 @@
 //!   - registry.rs —— SchemaRegistry 表/列白名单（SQL 注入根治点）
 //!   - runtime.rs  —— RuntimePool：复用 JsRuntime（预热 = 快照等价），V8 代码缓存
 //!   - loader.rs   —— HandlerStore：handler 源码加载 + 热重载（FS / 嵌入）
+//!   - transpile.rs—— TS→JS 转译（deno_ast strip types）+ mtime 全局缓存
 //!   - inspector.rs—— InspectorServer：deno_core 自带 inspector 的 DevTools WS 桥
 //!   - bootstrap.js —— JS 侧全局对象装配
 //!
@@ -32,6 +33,9 @@ mod log;
 mod query;
 mod registry;
 mod runtime;
+// T7 OjModuleLoader / T9 run_module 消费前暂无引用。
+#[allow(dead_code)]
+mod transpile;
 mod ws;
 
 pub use db::{DataAccessor, InMemoryAccessor, Row};
