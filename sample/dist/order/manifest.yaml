@@ -1,0 +1,3 @@
+name: "order"
+desc: "订单：建单、列表联查、详情缓存"
+version: "0.1.0"

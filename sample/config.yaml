@@ -1,0 +1,7 @@
+server:
+  host: "localhost"
+  port: 9778
+db:
+  default: "sqlite://db.sqlite"
+redis:
+  default: "redis://127.0.0.1:6379/1"   # v0.1: warn + 内存 KV 模拟

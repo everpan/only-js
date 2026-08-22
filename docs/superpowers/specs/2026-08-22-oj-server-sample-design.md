@@ -70,7 +70,11 @@ KillSwitch 408 熔断、actor 线程桥、axum 装配。
 | UC-12 | 408 熔断 | `while(true)` → 408，server 存活（ESM 模型下复验） | 临时文件用例 |
 | UC-13 | import 链路 | 相对导入工具函数参与处理（含跨模块 `../../`）；裸 specifier 解析失败报错含提示 | `user/_shared`、`order/*` |
 | UC-14 | 缓存与热重载 | 同路由连打 → 转译计数仅 1；改 api.ts → 下次请求新结果 | 计数器/日志断言 |
-| UC-15 | 裸 specifier | vendored `nanoid` import 生成订单号；不存在的包报「node_modules 未安装？」 | `order/account` |
+| UC-15 | 裸 specifier | vendored `escape-goat` import 转义订单号；不存在的包报「node_modules 未安装？」 | `order/account` |
+
+> 偏差（实现期）：vendored 包由 nanoid 改为 escape-goat——裸 deno_core 无
+> `crypto.getRandomValues`（Web API 由 Deno CLI 扩展提供，core 不含），nanoid v5
+> 依赖它；escape-goat 纯字符串操作、零依赖。UC-15 语义不变（裸 specifier 参与请求处理）。
 
 ## 4. sample 设计（文件级）
 
@@ -78,8 +82,8 @@ KillSwitch 408 熔断、actor 线程桥、axum 装配。
 sample/
 ├── config.yaml            # server.host/port + db.default + redis.default
 ├── seed.sql               # 建表 account(id,name,role)/orders(id,no,account_id,amount) + 种子，幂等
-├── package.json           # 声明 nanoid（vendored）
-├── node_modules/nanoid/   # 直接 vendor 提交（纯 ESM 两文件，测试零网络）
+├── package.json           # 声明 escape-goat（vendored）
+├── node_modules/escape-goat/   # 直接 vendor 提交（纯 ESM 两文件，测试零网络）
 ├── .gitignore             # db.sqlite
 ├── src/
 │   ├── user/
@@ -90,7 +94,7 @@ sample/
 │   │       └── detail/api.ts   # UC-4：三层嵌套镜像
 │   ├── order/
 │   │   ├── manifest.yaml  # name: "order"
-│   │   ├── account/api.ts # UC-15：nanoid 生成订单号（建单）
+│   │   ├── account/api.ts # UC-15：escape-goat 转义订单号（建单）
 │   │   ├── list/api.ts    # UC-5：join account；import user/_shared（跨模块）
 │   │   └── detail/api.ts  # UC-9：kv miss→db→set
 │   └── _shared/…          # 仅 user 模块内：见下
@@ -220,7 +224,7 @@ redis:
 | R1 | ESM/TLA 模型下 KillSwitch 408 是否仍有效 | 实现期第一个 spike：UC-12 E2E 先行 |
 | R2 | deno_core 模块加载精确机制（load_main_module vs dynamic-import driver、per-request dispatch、完成判定与事件循环泵） | 实现期 spike，回退路径：TLA 主模块 + mod_evaluate |
 | R3 | hash specifier 旧模块不可卸载 | 有界说明（编辑次数 × actor 数），接受 |
-| R4 | vendored nanoid 纯 ESM 假设 | 引入时验证（nanoid v5 ESM-only，两文件） |
+| R4 | vendored escape-goat 纯 ESM 假设 | 引入时验证（escape-goat v4 ESM-only，两文件） |
 
 ## 7. 测试计划
 
