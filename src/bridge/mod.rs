@@ -383,9 +383,11 @@ impl Bridge {
         }
         // 顺序以 0.410 签名为准：mod_evaluate 返回 `impl Future + use<>`（不借 runtime），
         // 先启动求值再驱动 event loop，最后 await 求值 future 取 TLA 错误。
+        // driver 以 side module 加载：每 JsRuntime 仅一个 main module，
+        // 池化 runtime 的第二个请求（driver/N 递增）会撞 MainModuleAlreadyExists。
         let result: Result<(), CoreError> = async {
             let id = rt
-                .load_main_es_module_from_code(&driver_spec, code)
+                .load_side_es_module_from_code(&driver_spec, code)
                 .await?;
             let eval = rt.mod_evaluate(id);
             rt.run_event_loop(deno_core::PollEventLoopOptions::default()).await?;
@@ -784,6 +786,33 @@ mod tests {
         let cap = b.run(r#"json.ok({ alive: true });"#).await.unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"]["alive"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_module_reuses_pooled_runtime_across_requests() {
+        // 回归：每 JsRuntime 仅一个 main module；driver 须以 side module 加载，
+        // 否则同一池化 runtime 的第二个请求报 main module already exists。
+        // 模块顶层每 runtime 只执行一次（ESM 缓存）→ n 跨请求累计。
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[(
+            "u/f/api.ts",
+            "let n = 0;\nexport default { get() { n += 1; json.ok({ n }); } };\n",
+        )]);
+        let b = module_bridge(&root);
+        let cap1 = b
+            .run_module(&api, "get", RequestInfo::default(), std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let cap2 = b
+            .run_module(&api, "get", RequestInfo::default(), std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(cap1.status, 200);
+        assert_eq!(cap2.status, 200);
+        let v1: Value = serde_json::from_slice(&cap1.body).unwrap();
+        let v2: Value = serde_json::from_slice(&cap2.body).unwrap();
+        assert_eq!(v1["data"], json!({"n": 1}), "{v1}");
+        assert_eq!(v2["data"], json!({"n": 2}), "{v2}");
     }
 
     #[tokio::test(flavor = "current_thread")]
