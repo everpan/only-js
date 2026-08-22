@@ -1,0 +1,220 @@
+# oj server 用户手册
+
+`oj` 是一个命令行工具：把按「模块 / 特性」目录组织好的 API 项目直接变成 REST 服务。
+开发者在项目里按目录写 `api.ts`，`oj server` 把目录树原样映射成 HTTP 路由——改文件即生效
+（dev 模式），编译产物可发布（release 模式）。
+
+## 1. 快速开始
+
+```bash
+cargo build                     # 构建（debug）
+
+# dev 模式：直接跑 .ts 源码
+cargo run -p oj -- server -c sample/config.yaml -d sample/src --dev
+
+# release 模式：跑编译产物 dist/
+cargo run -p oj -- server -c sample/config.yaml -d sample/dist
+```
+
+启动时会打印模块清单与路由表，然后：
+
+```bash
+curl 'http://localhost:9778/v1/api/user/account/?id=1'
+# → {"code":0,"msg":"ok","data":[{"id":1,"name":"neo","role":"admin"}]}
+```
+
+## 2. 命令与参数
+
+```
+oj server [-c config.yaml] [-b /v1/api] [-d src|dist] [--dev]
+```
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `-c` | `config.yaml` | 配置文件路径（host/port/db/redis） |
+| `-b` | `/v1/api` | 基础路由前缀 |
+| `-d` | `--dev` → `src`，否则 `dist` | 服务目录（模块树的根） |
+| `--dev` | 关 | 开发模式跑 `.ts`；缺省为 release 跑 `.js` |
+
+- `oj build moduleA` 是 v0.1 占位（未实现，预留 vite 包装）。无子命令则打印用法退出。
+- 相对路径（`-c`/`-d`）相对**当前工作目录**（CWD），不是相对 config 所在目录。
+
+## 3. 配置 config.yaml
+
+```yaml
+server:
+  host: "localhost"       # 监听地址（默认 localhost）
+  port: 9778              # 监听端口（代码默认 778，但 macOS 特权端口不可用 → 用 ≥1024）
+  timeout: "30s"          # 单请求执行超时（超时熔断 → 408）
+  pool_size: 4            # JS 执行线程数（并发度）
+db:
+  default: "sqlite://db.sqlite"   # 命名库实例；v0.1 仅支持 sqlite
+redis:
+  default: "redis://127.0.0.1:6379/1"   # v0.1 仅 warn 并退回内存 KV
+```
+
+- `server` 字段全可省（都有默认值）。
+- `db`：`name → DSN` 映射。v0.1 **只支持 sqlite**：`sqlite://<path>`（相对 config 目录）、
+  `sqlite::memory:`（内存库）。非 sqlite DSN 启动即报错。
+- `redis`：`name → url` 映射。v0.1 **不真连 Redis**，仅打印 warn 并用进程内存 KV 模拟
+  （`redis.get/set` 与 `kv.get/set` 同源）。
+- `timeout` 支持 `s`/`sec`/`secs`/`ms`/`m`/`min`，如 `"30s"`、`"500ms"`。
+- 项目根若存在 `seed.sql`，启动时对 `default` 库重放（语句按 `;` 切分，`INSERT OR IGNORE`
+  可重复执行；**注意**：seed 内不得有分号字面量）。
+
+## 4. 项目目录结构
+
+```
+<project>/
+├── config.yaml          # 服务配置
+├── seed.sql             # 可选，启动时对 default 库重放
+├── src/                 # --dev 服务目录（release 用 dist/，结构相同）
+│   ├── user/            # 首层子目录 = 模块名
+│   │   ├── manifest.yaml
+│   │   ├── _shared/validate.ts   # 无 api 文件 → 纯工具代码目录，不产生路由
+│   │   ├── account/api.ts        # → /v1/api/user/account/
+│   │   ├── profile/api.ts        # → /v1/api/user/profile/
+│   │   └── profile/detail/api.ts # → /v1/api/user/profile/detail/
+│   └── order/
+│       ├── manifest.yaml
+│       ├── account/api.ts        # → /v1/api/order/account/
+│       ├── list/api.ts           # → /v1/api/order/list/
+│       └── detail/api.ts         # → /v1/api/order/detail/
+└── node_modules/        # 裸 specifier 解析起点（见 §7 导入）
+```
+
+约束：
+- **首层子目录 = 模块**，每个都必须有 `manifest.yaml`；缺了启动失败。
+- 任意深度的子目录中放 `api.ts`（dev）/ `api.js`（release），即成为一条路由。
+- 没有 `api` 文件的目录不是路由，可作共享工具代码目录（如 `_shared`）。
+
+## 5. manifest.yaml（模块清单）
+
+```yaml
+name: "user"        # 必须等于父目录名（强约束，否则启动失败）
+desc: "用户信息相关，记录账号、地址等个人信息"
+version: "0.1.0"
+# config: {}        # 可选，本模块的其他设置
+```
+
+## 6. 编写 api.ts
+
+`api.ts` 导出一个对象，键是 HTTP 动词对应的方法名：
+
+```ts
+import { escapeHtml } from "escape-goat";      // 裸 specifier（node_modules）
+import { requireRole } from "../_shared/validate";  // 相对导入
+
+function get(): void {
+  const id = Number(http.param("id", 0));
+  db.query("select id, name from account where id = ?", [id])
+    .then((r) => json.ok(r))
+    .catch((e) => json.fail(500, String(e)));
+}
+
+function post(): void {
+  const b = http.body as { name?: string };   // 请求体（JSON 自动解析为对象）
+  if (!b.name) { json.fail(400, "name required"); return; }
+  db.exec("insert into account (name) values (?)", [b.name])
+    .then(() => json.ok({ created: true }))
+    .catch((e) => json.fail(500, String(e)));
+}
+
+export default { get, post };
+```
+
+要点：
+- **方法名**：`get/post/put/del/patch/head/options`（`DELETE` 映射为 `del`，不是 `delete`）。
+- **同步函数 + `.then().catch()`**：方法体同步返回，异步 db 调用走 Promise 链；runtime 会
+  泵 event loop 直到所有 Promise 落定后再写回响应。写 `async` 函数也可（driver 会 `await fn()`）。
+- **请求体** `http.body`：空 → `null`；能解析为 JSON → 对象/数组；否则 → UTF-8 字符串。
+- **响应** 用 `json.ok(data)` / `json.fail(code, msg, data?)`，见 §9。
+
+## 7. 路由规则
+
+URL = `{base}/{module}/{...path}/{feature}/` → `<root>/{module}/{...path}/{feature}/api.ts|js`。
+
+| HTTP 动词 | 调用的方法 |
+|---|---|
+| GET | `get` |
+| POST | `post` |
+| PUT | `put` |
+| DELETE | `del` |
+| PATCH | `patch` |
+| HEAD | `head` |
+| OPTIONS | `options` |
+
+- 路径任意深度：`/v1/api/user/profile/detail/` → `src/user/profile/detail/api.ts` 的 `get`。
+- 尾斜杠有无皆可。
+- 目录穿越 / 空段 / 非法段（`..`、`.`、`\`、NUL）→ **404**。
+
+## 8. 导入（import）
+
+- **相对导入** `./x`、`../x`：自动补全 `.ts` → `.js` → `/index.ts` → `/index.js`。
+- **裸 specifier** `import "escape-goat"`：从当前文件目录逐级向上找 `node_modules/<pkg>`
+  （至 project root），按 `package.json` 的 `module` → `main` → `index.js` 取入口；支持
+  `@scope/name` 与子路径 `pkg/lib/util.js`。
+- **CJS 包**：自动包装互操作（`module.exports` → `default`；`require("pkg")` 走
+  `__ojRequire`）。启发式识别，仅裸 specifier；相对 `require("./x")` 暂不支持（v0.1 限制）。
+- 所有解析结果被**钳制在 project root 内**（`..` 逃逸报错）。
+
+## 9. handler 可用全局对象
+
+| 全局 | 说明 |
+|---|---|
+| `json.ok(data)` | 成功信封（`{code:0,msg:"ok",data}`），HTTP 200 |
+| `json.fail(code, msg, data?)` | 失败信封，HTTP 状态 = `code`（`code<=0` 映射 500） |
+| `json.header(name, value)` | 设置响应头（同名后写覆盖） |
+| `http.method` | 请求方法字符串（`GET`/`POST`/…） |
+| `http.query` | query 参数对象（`{id: "1"}`） |
+| `http.headers` | 请求头对象 |
+| `http.body` | 请求体（见 §6） |
+| `http.param(name, default)` | 取 query 参数（等价 `http.query[name] ?? default`；**仅 query，无路径参数**） |
+| `db.query(sql, params?)` | 参数化查询 → Promise<rows> |
+| `db.exec(sql, params?)` | 参数化执行 → Promise |
+| `db.table(name).select(cols).where(cond).orderBy(..).limit(n).all()` | 安全查询构造器（白名单+参数化） |
+| `DB(name)` | 命名库实例（`db === DB("default")`） |
+| `kv.get/set/del(key)` | 内存 KV（v0.1 无真 Redis 时的缓存抽象） |
+| `redis.get/set(key)` | 同内存 KV（与 `kv` 同源） |
+| `log.debug/info/warn/error(msg, ...kv)` | 结构化日志 |
+| `fetch(url, options?)` | 浏览器风格 HTTP 客户端 |
+| `ws.send/close` | WebSocket 帧控制（HTTP 路径下 no-op） |
+
+SQL 占位符：sqlite 用 `?`（参数数组按序绑定）。
+
+## 10. 响应信封与错误
+
+统一信封 `{code, msg, data}`；HTTP 状态码 = `code`（`code=0` → 200）。
+
+| 场景 | HTTP | 信封示例 |
+|---|---|---|
+| 成功 | 200 | `{"code":0,"msg":"ok","data":…}` |
+| api 文件不存在 / 目录穿越 | 404 | `{"code":404,"msg":"no api file for route","data":null}` |
+| 方法未导出（如 `DELETE` 但无 `del`） | 405 | `{"code":405,"msg":"method 'del' not exported by …/api.ts","data":null}` |
+| TS 编译错误 / 模块解析失败 | 500 | `{"code":500,"msg":"…/api.ts: 语法错误…","data":null}` |
+| handler 死循环 / 超时 | 408 | `{"code":408,"msg":"handler execution timed out","data":null}` |
+
+业务层自定义错误用 `json.fail(400, "…")` 等直接返回对应状态码。
+
+## 11. 样例走读（sample/）
+
+`sample/` 是验收载体，两个模块 `user` / `order`：
+
+- **user/account**：账号 CRUD（`get/post/put/del/patch/head/options` 全表），`_shared/validate`
+  里 `positiveId`/`requireRole` 做参数校验（相对导入）。
+- **user/profile** 与 **user/profile/detail**：单点查询 + 更名；detail 演示三级路径路由。
+- **order/account**：建单时 `escapeHtml` 转义单号（裸 specifier `escape-goat`，vendored 在
+  `node_modules/`）；按 `account_id` 查单。
+- **order/list**：跨模块相对导入 `../../user/_shared/validate`（`requireRole`）+ `orders`/`account`
+  join 联查。
+- **order/detail**：`kv` 读穿缓存（命中返回 `cached:true`，未命中查库并回填）。
+
+跑法见 §1。验收用例见 `cli/tests/e2e.rs`（UC-1…15，含 404/405/500/408 负向路径）。
+
+## 12. 已知限制（v0.1）
+
+- `redis` 不真连 Redis，退回内存 KV。
+- `db` 仅 sqlite；`build` 子命令未实现。
+- 相对 `require("./x")`、`package.json` `exports`/`conditions`、pnpm 布局不支持。
+- 端口 778（代码默认）在 macOS 属特权端口，实际需 ≥1024。
+- `.tsx`/`.mts` 不转译（直通 V8）。
