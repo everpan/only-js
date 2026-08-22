@@ -259,5 +259,7 @@ redis:
 **风险复盘：** R1（ESM 下 KillSwitch 408）与 R2（side-module 驱动）均在实现期 spike 验证；
 R4（escape-goat ESM-only）经引入验证为真并落地 D1 替代方案。
 
-**遗留（终审待裁）：** `oj server -c config.yaml` 相对路径 → `config_dir=""` → project_root
-钳制静默失效；`load_modules` 缺失模块目录回落空（削弱 fail-fast）。
+**终审裁决（集中 review）：**
+- `oj server -c config.yaml`（bare 文件名）→ `config_dir=""` → 钳制失效 → **已修复**（`config_dir_of` 回落 `.`，commit `48b57da`）。
+- `load_modules` 缺失模块目录回落空 → **保留**（brief 自身 seeds 测试依赖；空项目合法；`-d` 拼错可由空路由表察觉）。
+- 其余 deferred minors（T4 尾斜杠归一、T5 http.param 原型链、T6 sourcemap 体积/计数含失败 parse、T7 with_extension 吃 `.min`、module_loader 绝对 file:// 绕过钳制）→ **接受**为 v0.1 已知限制（信任模型：所服务即开发者自有代码，clamp 为纵深防御非沙箱）。

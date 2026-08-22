@@ -75,4 +75,4 @@
   - vendored `escape-goat` 替代 spec 原 `nanoid`（裸 deno_core 无 `crypto.getRandomValues`）。
   - sample 端口 778 → 9778（macOS 特权端口）。
   - `-d` 路径相对 CWD 而非 config_dir。
-- **测试**：debug 61 passed + 1 ignored；release 61 passed + 1 ignored（root/server/oj，含 E2E UC-1..15）。
+- **测试**：debug 62 passed + 1 ignored；release 62 passed + 1 ignored（root/server/oj，含 E2E UC-1..15）。
