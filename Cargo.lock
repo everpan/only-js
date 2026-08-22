@@ -1956,6 +1956,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oj"
+version = "0.1.0"
+dependencies = [
+ "mdm-base-rust",
+ "mdm-server",
+ "reqwest",
+ "serde",
+ "serde_yaml",
+ "tokio",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
