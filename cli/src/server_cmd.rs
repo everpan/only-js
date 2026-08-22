@@ -19,7 +19,7 @@ use crate::manifest;
 
 pub async fn run(a: ServerArgs) -> Result<(), String> {
     let config_path = PathBuf::from(&a.config);
-    let config_dir = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let config_dir = config_dir_of(&config_path);
     let cfg = config::load_from(&config_dir, config_path.file_name().and_then(|s| s.to_str()))
         .map_err(|e| format!("load config: {e}"))?;
     let (addr, h) = start(cfg, &config_dir, PathBuf::from(&a.dir), a.base.clone(), a.dev).await?;
@@ -98,6 +98,16 @@ pub async fn start(
     Ok((bound, h))
 }
 
+/// config 文件的父目录（即 project_root）。bare 文件名（`parent()==""`）回落当前目录，
+/// 避免 config_dir 为空 → `canonicalize("")` 失败 → project_root 钳制静默失效。
+fn config_dir_of(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
 /// `host:port` → 首个解析地址（阻塞式，仅启动调用一次）。
 fn to_socket_addrs_sync(s: &str) -> Result<SocketAddr, String> {
     s.to_socket_addrs()
@@ -149,6 +159,15 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn config_dir_never_empty() {
+        // bare 文件名回落当前目录（project_root 钳制不因空路径失效）。
+        assert_eq!(config_dir_of(Path::new("config.yaml")), PathBuf::from("."));
+        assert_eq!(config_dir_of(Path::new("./config.yaml")), PathBuf::from("."));
+        assert_eq!(config_dir_of(Path::new("sub/config.yaml")), PathBuf::from("sub"));
+        assert_eq!(config_dir_of(Path::new("/abs/config.yaml")), PathBuf::from("/abs"));
     }
 
     #[tokio::test]
