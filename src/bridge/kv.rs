@@ -21,6 +21,8 @@ pub trait KVStore: Send + Sync {
     async fn get(&self, key: &str) -> BridgeResult<Option<String>>;
     /// 写入键值。
     async fn set(&self, key: &str, value: &str) -> BridgeResult<()>;
+    /// 删除键（幂等：不存在为成功）。
+    async fn del(&self, key: &str) -> BridgeResult<()>;
 }
 
 /// KVStore 的内存实现（fake，测试/演示用）。
@@ -46,6 +48,11 @@ impl KVStore for InMemoryKV {
             .write()
             .unwrap()
             .insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+
+    async fn del(&self, key: &str) -> BridgeResult<()> {
+        self.mu.write().unwrap().remove(key);
         Ok(())
     }
 }
@@ -74,6 +81,19 @@ pub async fn op_kv_set(
 ) -> Result<bool, JsErrorBox> {
     let kv = state.borrow().borrow::<Arc<StableState>>().kv.clone();
     kv.set(&key, &value)
+        .await
+        .map_err(|e| JsErrorBox::generic(e.to_string()))?;
+    Ok(true)
+}
+
+/// kv.del(key)：Promise<true>。
+#[op2]
+pub async fn op_kv_del(
+    state: Rc<RefCell<OpState>>,
+    #[string] key: String,
+) -> Result<bool, JsErrorBox> {
+    let kv = state.borrow().borrow::<Arc<StableState>>().kv.clone();
+    kv.del(&key)
         .await
         .map_err(|e| JsErrorBox::generic(e.to_string()))?;
     Ok(true)

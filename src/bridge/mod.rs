@@ -101,6 +101,7 @@ deno_core::extension!(
         http::op_http_info,
         kv::op_kv_get,
         kv::op_kv_set,
+        kv::op_kv_del,
         db::op_db_has,
         db::op_db_query,
         db::op_db_exec,
@@ -465,6 +466,34 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"]["n"], 1, "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_param_and_kv_global() {
+        let (b, _) = new_bridge();
+        let cap = b
+            .run_with(
+                r#"
+                kv.set("k", "v");
+                kv.get("k").then((v) => {
+                    const hit = v;
+                    kv.del("k");
+                    kv.get("k").then((v2) => json.ok({
+                        hit, gone: v2,
+                        p1: http.param("id", 0),
+                        p2: http.param("missing", "dft"),
+                    }));
+                }).catch((e) => json.fail(500, String(e)));
+                "#,
+                RequestInfo {
+                    query: [("id".into(), "7".into())].into_iter().collect(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"], json!({"hit": "v", "gone": null, "p1": "7", "p2": "dft"}), "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]
