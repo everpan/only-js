@@ -16,7 +16,7 @@
 //!   - bootstrap.js —— JS 侧全局对象装配
 //!
 //! 状态拆分（revised）：
-//!   - `StableState`：跨请求不变（kv / dbs / client / registry），`Arc` 共享，创建一次。
+//!   - `StableState`：跨请求不变（kv / dbs / client / registry / loader），`Arc` 共享，创建一次。
 //!   - `ReqState`：每请求可变（req / 响应捕获 / done），存入 OpState，checkout 时重置。
 //! 如此 JsRuntime 可池化复用而不串号请求。
 
@@ -65,6 +65,9 @@ pub struct StableState {
     pub dbs: HashMap<String, Arc<dyn DataAccessor>>,
     pub client: reqwest::Client,
     pub registry: Arc<SchemaRegistry>,
+    /// oj 模块加载配置（node_modules 回溯上界 + CJS require 的 project_root）。
+    /// T9 装配注入；devserver 旧路径不配（裸 specifier / __ojRequire 不可用）。
+    pub loader: Option<Arc<module_loader::LoaderShared>>,
 }
 
 /// ReqState：每请求可变状态（存在 OpState 中，checkout 时整体重置）。
@@ -114,6 +117,7 @@ deno_core::extension!(
         query::op_db_query_build,
         fetch::op_fetch,
         log::op_log,
+        module_loader::op_resolve_cjs,
         ws::op_ws_send,
         ws::op_ws_close,
     ],
@@ -195,6 +199,7 @@ impl Bridge {
                 .build()
                 .unwrap_or_default(),
             registry: Arc::new(registry),
+            loader: None,
         });
         let pool = runtime::RuntimePool::new(stable.clone(), inspect);
         Self {
@@ -559,6 +564,50 @@ mod tests {
         let cap = b.run(r#"json.ok({ alive: true });"#).await.unwrap();
         let v: Value = serde_json::from_slice(&cap.body).unwrap();
         assert_eq!(v["data"]["alive"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oj_require_cjs_interop_end_to_end() {
+        // T8 契约：__ojRequire(name, referrer) → op 解析 + eval + 嵌套 require。
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "oj-req-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        for (rel, content) in [
+            ("node_modules/cjspkg/package.json", r#"{"name":"cjspkg","main":"main.js"}"#),
+            // 嵌套 require：dep 经 __ojRequire 的 resolved.path 再解析。
+            ("node_modules/cjspkg/main.js", "module.exports = { n: 1, dep: require(\"cjspkg-dep\").d };\n"),
+            ("node_modules/cjspkg-dep/index.js", "module.exports = { d: 2 };\n"),
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+        let stable = Arc::new(StableState {
+            kv: Arc::new(InMemoryKV::new()),
+            dbs: HashMap::new(),
+            client: Default::default(),
+            registry: Arc::new(SchemaRegistry::new()),
+            loader: Some(Arc::new(LoaderShared { project_root: root.clone(), ts: false })),
+        });
+        let pool = runtime::RuntimePool::new(stable, false);
+        let mut rt = pool.checkout();
+        let referrer = root.join("src/handler.js");
+        let src = format!(
+            r#"const c = __ojRequire("cjspkg", {referrer:?}); json.ok({{ n: c.n, dep: c.dep }});"#
+        );
+        runtime::run_to_completion(&mut rt, "handler.js", src).await.unwrap();
+        let v: Value = {
+            let op_state = runtime::op_state(&rt);
+            let g = op_state.borrow();
+            serde_json::from_slice(&g.borrow::<ReqState>().response.clone().unwrap())
+                .unwrap()
+        };
+        pool.checkin(rt);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(v["data"], json!({ "n": 1, "dep": 2 }), "{v}");
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -8,12 +8,15 @@ use std::time::SystemTime;
 
 use deno_core::ModuleSpecifier;
 use deno_core::error::ModuleLoaderError;
+use deno_core::{OpState, op2};
+use deno_error::JsErrorBox;
 // 0.410：`modules` 模块私有，loader 相关类型全部经 crate 根再导出（lib.rs:137-160）。
 use deno_core::{
     ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleResolveResponse,
     ModuleSource, ModuleSourceCode, ModuleType, ResolutionKind,
 };
 
+use super::StableState;
 use super::transpile::cached_transpile;
 
 /// loader 共享配置（project_root 用于 node_modules 回溯上界与 CJS require）。
@@ -64,10 +67,8 @@ impl OjModuleLoader {
             let p = resolve_relative(&ref_dir, specifier, self.inner.ts)?;
             versioned_specifier(&p)
         } else {
-            // 裸 specifier：T8 实现（本任务先报清晰错误）。
-            Err(format!(
-                "bare specifier '{specifier}' not supported yet (node_modules resolution lands in the next task)"
-            ))
+            let p = resolve_bare(specifier, &ref_dir, &self.inner.project_root)?;
+            versioned_specifier(&p)
         }
     }
 
@@ -77,7 +78,11 @@ impl OjModuleLoader {
             .to_file_path()
             .map_err(|_| ModuleLoaderError::generic(format!("not a file url: {spec}")))?;
         let src = cached_transpile(&path).map_err(ModuleLoaderError::generic)?;
-        let code = if looks_cjs(&src) { wrap_cjs(&src) } else { src };
+        let code = if looks_cjs(&src) {
+            wrap_cjs(&src, &path.display().to_string())
+        } else {
+            src
+        };
         Ok(ModuleSource::new(
             ModuleType::JavaScript,
             ModuleSourceCode::String(code.into()),
@@ -142,6 +147,71 @@ pub fn resolve_relative(base_dir: &Path, spec: &str, ts: bool) -> Result<PathBuf
     ))
 }
 
+/// 裸 specifier 解析（Node 算法简化版）：
+/// pkg → <dir>/node_modules/<pkg>（从 from_dir 逐级向上至 root）→ package.json
+/// 的 module → main → index.js；subpath（pkg/a.js）直映射包内文件。
+/// ponytail: 不做 exports/conditions 映射与 pnpm 布局；主流简单包可用。
+pub fn resolve_bare(spec: &str, from_dir: &Path, root: &Path) -> Result<PathBuf, String> {
+    // pkg 名：@scope/name 占两段。
+    let mut parts: Vec<&str> = spec.split('/').collect();
+    let pkg = if parts.first().is_some_and(|s| s.starts_with('@')) && parts.len() >= 2 {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        parts[0].to_string()
+    };
+    let sub: Vec<&str> = if pkg.contains('/') { parts.split_off(2) } else { parts.split_off(1) };
+
+    let mut tried = Vec::new();
+    let mut dir = Some(from_dir);
+    while let Some(d) = dir {
+        let nm = d.join("node_modules").join(&pkg);
+        if nm.is_dir() {
+            if sub.is_empty() {
+                let p = pkg_entry(&nm)?;
+                return Ok(p);
+            }
+            let p = nm.join(sub.join("/"));
+            if p.is_file() {
+                return Ok(p);
+            }
+            tried.push(p.display().to_string());
+        } else {
+            tried.push(nm.display().to_string());
+        }
+        if d == root {
+            break;
+        }
+        dir = d.parent();
+    }
+    Err(format!(
+        "cannot resolve '{spec}' from '{}' (node_modules installed?): tried [{}]",
+        from_dir.display(),
+        tried.join(", ")
+    ))
+}
+
+/// 包入口：package.json 的 module → main → index.js。
+fn pkg_entry(pkg_dir: &Path) -> Result<PathBuf, String> {
+    let pj = pkg_dir.join("package.json");
+    if pj.is_file() {
+        let text = std::fs::read_to_string(&pj).map_err(|e| format!("read {pj:?}: {e}"))?;
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        for field in ["module", "main"] {
+            if let Some(m) = v[field].as_str() {
+                let p = pkg_dir.join(m.trim_start_matches("./"));
+                if p.is_file() {
+                    return Ok(p);
+                }
+            }
+        }
+    }
+    let idx = pkg_dir.join("index.js");
+    if idx.is_file() {
+        return Ok(idx);
+    }
+    Err(format!("package '{}' has no entry (module/main/index.js)", pkg_dir.display()))
+}
+
 /// 版本化 specifier：file://<abs>?v=<mtime nanos>（mtime 变 → 新模块 → 热重载）。
 pub fn versioned_specifier(path: &Path) -> Result<ModuleSpecifier, String> {
     let mtime = std::fs::metadata(path)
@@ -165,11 +235,40 @@ pub fn looks_cjs(src: &str) -> bool {
         && !src.contains("import(")
 }
 
-/// CJS → ESM 包装：default = module.exports；require 由 __ojRequire 全局提供（T8）。
-pub fn wrap_cjs(src: &str) -> String {
+/// CJS → ESM 包装：default = module.exports；require 绑定为 `__ojRequire(n, 模块自身路径)`，
+/// 包内嵌套 require 从包目录解析（裸传 __ojRequire 会丢 referrer）。
+pub fn wrap_cjs(src: &str, module_path: &str) -> String {
+    // JSON 编码即合法 JS 字符串字面量（处理引号/反斜杠）。
+    let referrer = serde_json::to_string(module_path).unwrap_or_else(|_| "\"\"".into());
     format!(
-        "const __oj_cjs_module = {{ exports: {{}} }};\n(function (module, exports, require) {{\n{src}\n}})(__oj_cjs_module, __oj_cjs_module.exports, __ojRequire);\nexport default __oj_cjs_module.exports;\n"
+        "const __oj_cjs_module = {{ exports: {{}} }};\n(function (module, exports, require) {{\n{src}\n}})(__oj_cjs_module, __oj_cjs_module.exports, (n) => __ojRequire(n, {referrer}));\nexport default __oj_cjs_module.exports;\n"
     )
+}
+
+/// CJS require 底座：node_modules 解析 + 读源码（JS 侧 __ojRequire eval 执行）。
+/// project_root 取 StableState.loader（T9 oj 装配注入；未配置时报错）。
+/// ponytail: 仅裸 specifier；相对 require 与 exports 映射待真实依赖出现再加。
+#[op2]
+#[serde]
+pub fn op_resolve_cjs(
+    state: &mut OpState,
+    #[string] name: String,
+    #[string] referrer: String,
+) -> Result<serde_json::Value, JsErrorBox> {
+    let root = state
+        .borrow::<Arc<StableState>>()
+        .loader
+        .as_ref()
+        .map(|l| l.project_root.clone())
+        .ok_or_else(|| JsErrorBox::generic("project root not configured (loader wiring pending)"))?;
+    let from = Path::new(&referrer)
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let p = resolve_bare(&name, &from, &root).map_err(JsErrorBox::generic)?;
+    let code = std::fs::read_to_string(&p)
+        .map_err(|e| JsErrorBox::generic(format!("read {}: {e}", p.display())))?;
+    Ok(serde_json::json!({ "path": p.display().to_string(), "code": code }))
 }
 
 #[cfg(test)]
@@ -218,12 +317,40 @@ mod tests {
     }
 
     #[test]
+    fn bare_resolves_node_modules() {
+        let root = fx(&[
+            ("node_modules/escape-goat/index.js", "export const x = 1;\n"),
+            ("node_modules/escape-goat/package.json",
+             r#"{"name":"escape-goat","version":"4.0.0","type":"module"}"#),
+            ("node_modules/cjspkg/main.js", "module.exports = { n: 1 };\n"),
+            ("node_modules/cjspkg/package.json",
+             r#"{"name":"cjspkg","version":"1.0.0","main":"main.js"}"#),
+            ("node_modules/withmod/pkg/lib/util.js", "export const u = 1;\n"),
+            ("node_modules/withmod/pkg/package.json", r#"{"name":"withmod"}"#),
+        ]);
+        let from = root.join("src/user");
+        // ESM 包：type:module → index.js。
+        assert!(resolve_bare("escape-goat", &from, &root).unwrap().ends_with("escape-goat/index.js"));
+        // CJS 包：main 字段。
+        assert!(resolve_bare("cjspkg", &from, &root).unwrap().ends_with("cjspkg/main.js"));
+        // subpath 直映射。
+        assert!(resolve_bare("withmod/pkg/lib/util.js", &from, &root).unwrap().ends_with("lib/util.js"));
+        // 不存在 → 错误含提示。
+        let e = resolve_bare("nope-pkg", &from, &root).unwrap_err();
+        assert!(e.contains("node_modules"), "{e}");
+        // 回溯：src/user/feat 深处也能找到根 node_modules。
+        assert!(resolve_bare("escape-goat", &root.join("src/user/feat"), &root).is_ok());
+    }
+
+    #[test]
     fn cjs_detection_and_wrap() {
         assert!(looks_cjs("module.exports = { a: 1 };\n"));
         assert!(!looks_cjs("export default 1;\n"));
         assert!(!looks_cjs("import x from 'y';\nmodule.exports = x;\n"));
-        let wrapped = wrap_cjs("module.exports = { a: 1 };\n");
+        let wrapped = wrap_cjs("module.exports = { a: 1 };\n", "/nm/p/main.js");
         assert!(wrapped.contains("__oj_cjs_module"), "{wrapped}");
         assert!(wrapped.contains("export default __oj_cjs_module.exports"), "{wrapped}");
+        // require 绑定模块自身路径（嵌套 require 的 referrer）。
+        assert!(wrapped.contains(r#"__ojRequire(n, "/nm/p/main.js")"#), "{wrapped}");
     }
 }
