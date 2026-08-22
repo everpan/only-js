@@ -73,17 +73,19 @@ pub fn transpile_src(path: &Path, src: &str) -> Result<String, String> {
     Ok(out.into_source().text)
 }
 
+/// 计数器为进程全局，测试并行跑会互相污染 delta 断言——
+/// 所有会触发 .ts 转译的测试（本组 + bridge 模块测试的 run_module 路径）共用此锁串行。
+/// （不能复用 cache 锁：cached_transpile 内部已持有，重入会死锁。）
+#[cfg(test)]
+pub(crate) static TRANSPILE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 计数器为进程全局，测试并行跑会互相污染 delta 断言——串行化本组。
-    /// （不能复用 cache 锁：cached_transpile 内部已持有，重入会死锁。）
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn strips_type_annotations() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TRANSPILE_TEST_LOCK.lock().unwrap();
         let out = transpile_src(Path::new("a.ts"),
             "const x: number = 1;\nfunction f(a: string): string { return a; }\nexport default 1;\n").unwrap();
         assert!(out.contains("const x = 1;"), "{out}");
@@ -93,14 +95,14 @@ mod tests {
 
     #[test]
     fn syntax_error_has_position() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TRANSPILE_TEST_LOCK.lock().unwrap();
         let e = transpile_src(Path::new("bad.ts"), "function {{{{").unwrap_err();
         assert!(e.contains("bad.ts"), "{e}");
     }
 
     #[test]
     fn cache_hits_on_second_call_same_mtime() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TRANSPILE_TEST_LOCK.lock().unwrap();
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir();
         let p = dir.join(format!("oj-tr-{}-{}.ts", std::process::id(),

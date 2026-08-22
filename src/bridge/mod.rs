@@ -180,10 +180,21 @@ impl Bridge {
     /// 全量命名 DB 构造期注入（对齐 Go buildServer 的 DBAccessors + default 回落）。
     /// 须在构造期给定全量：StableState 一经 runtime 池共享即不可变。
     pub fn with_dbs(
+        dbs: HashMap<String, Arc<dyn DataAccessor>>,
+        kv: Arc<dyn KVStore>,
+        registry: SchemaRegistry,
+        inspect: bool,
+    ) -> Self {
+        Self::with_dbs_and_loader(dbs, kv, registry, inspect, None)
+    }
+
+    /// 全量命名 DB + 模块加载器构造（oj server 专用路径，T10/T11 装配消费）。
+    pub fn with_dbs_and_loader(
         mut dbs: HashMap<String, Arc<dyn DataAccessor>>,
         kv: Arc<dyn KVStore>,
         registry: SchemaRegistry,
         inspect: bool,
+        loader: Option<Arc<module_loader::LoaderShared>>,
     ) -> Self {
         // 防御：无 "default" 键时取任一实例补位（对齐 Go buildServer；JS 侧 db = DB("default")）。
         if !dbs.contains_key("default") {
@@ -199,7 +210,7 @@ impl Bridge {
                 .build()
                 .unwrap_or_default(),
             registry: Arc::new(registry),
-            loader: None,
+            loader,
         });
         let pool = runtime::RuntimePool::new(stable.clone(), inspect);
         Self {
@@ -327,6 +338,83 @@ impl Bridge {
             Err(e) => Err(RunError::Core(e)),
         }
     }
+
+    /// ESM 模式执行：TLA driver 模块 import api 模块并调 default[method]。
+    /// KillSwitch/ReqState 复用 run_ws 的熔断与捕获路径；被熔断的 runtime 同样不归还池。
+    pub async fn run_module(
+        &self,
+        api_path: &std::path::Path,
+        method: &str,
+        req: RequestInfo,
+        timeout: std::time::Duration,
+    ) -> Result<Capture, RunError> {
+        let spec = module_loader::versioned_specifier(api_path)
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e))))?;
+        static DRIVER_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = DRIVER_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let driver_spec = deno_core::ModuleSpecifier::parse(&format!("file:///oj/driver/{n}.js"))
+            .map_err(|e| RunError::Core(CoreError::from(std::io::Error::other(e.to_string()))))?;
+        // TLA driver：import 命中 V8 模块缓存（?v= 不变时零转译零重编译）；
+        // 方法未导出 → json.fail(405)（信封映射 HTTP 405）。
+        // method/msg 以 JSON 编码嵌入（合法 JS 字面量，杜绝引号注入）。
+        let method_lit = serde_json::to_string(method).unwrap_or_else(|_| "\"\"".into());
+        let msg_lit = serde_json::to_string(&format!(
+            "method '{method}' not exported by {}",
+            api_path.display()
+        ))
+        .unwrap_or_else(|_| "\"method not exported\"".into());
+        let code = format!(
+            "const m = await import(\"{spec}\");\n\
+             const fn = m.default && m.default[{method_lit}];\n\
+             if (typeof fn !== \"function\") json.fail(405, {msg_lit});\n\
+             else await fn();\n"
+        );
+        let mut rt = self.pool.checkout();
+        // isolate 裸指针：仅在 arm..disarm 窗口内被看门狗解引用（窗口内 runtime 存活）。
+        let ptr: usize = {
+            let iso: &mut deno_core::v8::Isolate = &mut *rt.v8_isolate();
+            iso as *mut _ as usize
+        };
+        self.kill.arm(ptr, timeout);
+        {
+            let op_state = runtime::op_state(&rt);
+            let mut g = op_state.borrow_mut();
+            g.borrow_mut::<ReqState>().reset(req);
+        }
+        // 顺序以 0.410 签名为准：mod_evaluate 返回 `impl Future + use<>`（不借 runtime），
+        // 先启动求值再驱动 event loop，最后 await 求值 future 取 TLA 错误。
+        let result: Result<(), CoreError> = async {
+            let id = rt
+                .load_main_es_module_from_code(&driver_spec, code)
+                .await?;
+            let eval = rt.mod_evaluate(id);
+            rt.run_event_loop(deno_core::PollEventLoopOptions::default()).await?;
+            eval.await?;
+            Ok(())
+        }
+        .await;
+        if self.kill.disarm() {
+            // runtime 已被 terminate，不可复用，直接丢弃（不 checkin）。
+            return Err(RunError::Timeout);
+        }
+        match result {
+            Ok(()) => {
+                let capture = {
+                    let op_state = runtime::op_state(&rt);
+                    let g = op_state.borrow();
+                    let rs = g.borrow::<ReqState>();
+                    Capture {
+                        status: rs.status,
+                        headers: rs.headers.clone(),
+                        body: rs.response.clone().unwrap_or_default(),
+                    }
+                };
+                self.pool.checkin(rt);
+                Ok(capture)
+            }
+            Err(e) => Err(RunError::Core(e)),
+        }
+    }
 }
 
 /// WS 帧执行结果：HTTP 捕获 + ws.send 集合 + ws.close 置位。
@@ -366,7 +454,9 @@ pub fn start_inspector(bridge: &Bridge, addr: std::net::SocketAddr) {
     inspector::spawn(insp, addr);
 }
 
+// run_module 系测试持 TRANSPILE_TEST_LOCK 跨 await（current_thread 单线程，安全）。
 #[cfg(test)]
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
@@ -608,6 +698,104 @@ mod tests {
         pool.checkin(rt);
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(v["data"], json!({ "n": 1, "dep": 2 }), "{v}");
+    }
+
+    fn mod_fx(files: &[(&str, &str)]) -> (std::path::PathBuf, std::path::PathBuf) {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "oj-mod-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        for (rel, content) in files {
+            let p = base.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+        (base.clone(), base.join(files[0].0))
+    }
+
+    fn module_bridge(root: &std::path::Path) -> Bridge {
+        Bridge::with_dbs_and_loader(
+            HashMap::new(),
+            Arc::new(InMemoryKV::new()),
+            SchemaRegistry::new(),
+            false,
+            Some(Arc::new(LoaderShared { project_root: root.to_path_buf(), ts: true })),
+        )
+    }
+
+    /// run_module 系列触发 .ts 转译：与 transpile 测试的计数器 delta 断言互斥
+    /// （current_thread 单线程 runtime，锁跨 await 安全；poison 不级联）。
+    fn transpile_serial() -> std::sync::MutexGuard<'static, ()> {
+        transpile::TRANSPILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runs_exported_method_from_ts_module() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[
+            (
+                "user/account/api.ts",
+                "import { tag } from \"../_shared/util\";\n\
+                 function get(): void { json.ok({ ok: 1, tag: tag(\"x\") }); }\n\
+                 export default { get };\n",
+            ),
+            (
+                "user/_shared/util.ts",
+                "export function tag(s: string): string { return \"t-\" + s; }\n",
+            ),
+        ]);
+        let b = module_bridge(&root);
+        let cap = b
+            .run_module(&api, "get", RequestInfo::default(), std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 200);
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"], json!({"ok": 1, "tag": "t-x"}), "{v}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn method_not_exported_is_405() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[("u/f/api.ts", "export default { get() { json.ok({}); } };\n")]);
+        let b = module_bridge(&root);
+        let cap = b
+            .run_module(&api, "del", RequestInfo::default(), std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(cap.status, 405, "{}", String::from_utf8_lossy(&cap.body));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn infinite_module_handler_times_out_and_bridge_survives() {
+        let _t = transpile_serial();
+        // R1 spike：ESM/TLA 模型下 KillSwitch 复验。
+        let (root, api) = mod_fx(&[("u/f/api.ts", "export default { get() { while (true) {} } };\n")]);
+        let b = module_bridge(&root);
+        let r = b
+            .run_module(&api, "get", RequestInfo::default(), std::time::Duration::from_millis(200))
+            .await;
+        assert!(matches!(r, Err(RunError::Timeout)), "got: {r:?}");
+        let cap = b.run(r#"json.ok({ alive: true });"#).await.unwrap();
+        let v: Value = serde_json::from_slice(&cap.body).unwrap();
+        assert_eq!(v["data"]["alive"], true);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn syntax_error_returns_core_error_with_position() {
+        let _t = transpile_serial();
+        let (root, api) = mod_fx(&[("u/f/api.ts", "function {{{{\nexport default {};\n")]);
+        let b = module_bridge(&root);
+        let e = b
+            .run_module(&api, "get", RequestInfo::default(), std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("api.ts"), "{}", e.to_string());
     }
 
     #[tokio::test(flavor = "current_thread")]
