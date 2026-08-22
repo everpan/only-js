@@ -34,9 +34,7 @@ mod module_loader;
 mod query;
 mod registry;
 mod runtime;
-// T7 OjModuleLoader / T9 run_module 消费前暂无引用。
-#[allow(dead_code)]
-mod transpile;
+pub mod transpile;
 mod ws;
 
 pub use db::{DataAccessor, InMemoryAccessor, Row};

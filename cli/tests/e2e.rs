@@ -1,0 +1,203 @@
+//! E2E：sample 作为 oj server 验收载体（spec UC-1~6,8,9,13,14,15）。
+//!
+//! transpile_hits 是进程级计数，sibling 测试并发转译会污染 uc14 的
+//! delta==1 断言（T9 教训），故全体用例串行：E2E_LOCK 全程持有。
+
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use mdm_base_rust::bridge::transpile::transpile_hits;
+use mdm_base_rust::config::Config;
+use oj::server_cmd;
+
+fn lock() -> MutexGuard<'static, ()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn sample() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../sample").canonicalize().unwrap()
+}
+
+async fn boot(dev: bool) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>, PathBuf) {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // config_dir = sample 项目根（loader 的 project_root 钳制要求 api 在根内）；
+    // 仅 db 用独立临时文件隔离，seed 由 start() 对新库重放。
+    let tmp = std::env::temp_dir().join(format!("oj-e2e-{}-{}", std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let root = sample();
+    let mut cfg: Config =
+        serde_yaml::from_str(&std::fs::read_to_string(root.join("config.yaml")).unwrap()).unwrap();
+    cfg.server.port = 0;
+    cfg.db.insert("default".into(), format!("sqlite://{}/db.sqlite", tmp.display()));
+    let dir = root.join(if dev { "src" } else { "dist" });
+    let (addr, h) = server_cmd::start(cfg, &root, dir, "/v1/api".into(), dev).await.unwrap();
+    (addr, h, tmp)
+}
+
+async fn req(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> (u16, serde_json::Value) {
+    let c = reqwest::Client::new();
+    let mut r = c.request(
+        reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+        format!("http://{addr}{path}"),
+    );
+    if let Some(b) = body {
+        r = r.header("content-type", "application/json").body(b.to_string());
+    }
+    let resp = r.send().await.unwrap();
+    let status = resp.status().as_u16();
+    // HEAD 无 body，reqwest 解 JSON 会挂：只回 status。
+    if method == "HEAD" {
+        return (status, serde_json::Value::Null);
+    }
+    (status, resp.json().await.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc1_method_table() {
+    let _g = lock();
+    let (addr, _h, _t) = boot(true).await;
+    // 各动词给最小合法输入：断言的是路由表本身（到 handler 即 200，空 body 会被
+    // handler 的 body 解析拒绝，与路由无关）。
+    let cases: &[(&str, Option<&str>)] = &[
+        ("GET", None),
+        ("POST", Some(r#"{"name":"m","role":"user"}"#)),
+        ("PUT", Some(r#"{"id":1,"name":"n"}"#)),
+        ("DELETE", None),
+        ("PATCH", Some(r#"{"id":1,"role":"user"}"#)),
+        ("OPTIONS", None),
+        ("HEAD", None),
+    ];
+    for (m, b) in cases {
+        let path = match *m {
+            "DELETE" => "/v1/api/user/account/?id=999",
+            _ => "/v1/api/user/account/",
+        };
+        let (s, _) = req(addr, m, path, *b).await;
+        assert_eq!(s, 200, "{m}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc2_uc3_crud_params_body() {
+    let _g = lock();
+    let (addr, _h, _t) = boot(true).await;
+    let name = format!("u-{}", std::process::id());
+    // POST body 建号。
+    let (s, v) = req(
+        addr,
+        "POST",
+        "/v1/api/user/account/",
+        Some(&format!(r#"{{"name":"{name}","role":"admin"}}"#)),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["code"], 0, "{v}");
+    // query 参数查回。
+    let (s, v) = req(addr, "GET", "/v1/api/user/account/?id=1", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["data"][0]["name"], "neo", "{v}");
+    // PUT 改名后 GET 验证。
+    let _ = req(addr, "PUT", "/v1/api/user/account/", Some(r#"{"id":1,"name":"neo2"}"#)).await;
+    let (_, v) = req(addr, "GET", "/v1/api/user/account/?id=1", None).await;
+    assert_eq!(v["data"][0]["name"], "neo2", "{v}");
+    let (s, _) = req(addr, "DELETE", "/v1/api/user/account/?id=2", None).await;
+    assert_eq!(s, 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc4_nested_route_uc5_join() {
+    let _g = lock();
+    let (addr, _h, _t) = boot(true).await;
+    let (s, v) = req(addr, "GET", "/v1/api/user/profile/detail/", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["data"]["depth"], 3, "{v}");
+    let (s, v) = req(addr, "GET", "/v1/api/order/list/", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["data"][0]["account_name"], "neo", "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc6_release_mode_dist() {
+    let _g = lock();
+    let (addr, _h, _t) = boot(false).await;
+    let (s, v) = req(addr, "GET", "/v1/api/user/account/?id=1", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["data"][0]["name"], "neo", "{v}");
+    let (s, v) = req(addr, "GET", "/v1/api/order/list/", None).await;
+    assert_eq!((s, v["data"][0]["account_name"].as_str().unwrap()), (200, "neo"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc9_kv_cache_read_through() {
+    let _g = lock();
+    let (addr, _h, _t) = boot(true).await;
+    let (_, v1) = req(addr, "GET", "/v1/api/order/detail/?id=1", None).await;
+    assert_eq!(v1["data"]["cached"], false, "{v1}");
+    let (_, v2) = req(addr, "GET", "/v1/api/order/detail/?id=1", None).await;
+    assert_eq!(v2["data"]["cached"], true, "{v2}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc13_uc15_imports_and_bare() {
+    let _g = lock();
+    let (addr, _h, _t) = boot(true).await;
+    // 裸 specifier：建单时 escapeHtml 生效（<script> 被转义）。
+    let (s, v) = req(
+        addr,
+        "POST",
+        "/v1/api/order/account/",
+        Some(r#"{"account_id":1,"amount":9.9,"no":"<script>x</script>"}"#),
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["data"]["no"], "&lt;script&gt;x&lt;/script&gt;", "{v}");
+    // 跨模块相对导入（requireRole）过滤 role=user（只回 trinity 的单）。
+    let (_, v) = req(addr, "GET", "/v1/api/order/list/?role=user", None).await;
+    assert_eq!(v["data"][0]["account_name"], "trinity", "{v}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc14_transpile_cache_and_hot_reload() {
+    let _g = lock();
+    // 独立临时项目（不动 sample 文件）。
+    let t = std::env::temp_dir().join(format!("oj-hot-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&t);
+    std::fs::create_dir_all(t.join("src/u/f")).unwrap();
+    std::fs::write(t.join("src/u/manifest.yaml"), "name: u\ndesc: d\nversion: 0.1.0\n").unwrap();
+    std::fs::write(
+        t.join("src/u/f/api.ts"),
+        "export default { get() { json.ok({ v: 1 }); } };\n",
+    )
+    .unwrap();
+    let mut cfg = Config::default();
+    cfg.server.port = 0;
+    cfg.db.insert("default".into(), "sqlite::memory:".into());
+    std::fs::write(t.join("seed.sql"), "").unwrap();
+    let (addr, _h) =
+        server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true).await.unwrap();
+    let before = transpile_hits();
+    for _ in 0..3 {
+        let (_, v) = req(addr, "GET", "/v1/api/u/f/", None).await;
+        assert_eq!(v["data"]["v"], 1);
+    }
+    // 3 次请求只发生 1 次实际转译（转译缓存全局共享，跨 actor）。
+    assert_eq!(transpile_hits(), before + 1);
+    // 热重载：改文件 → mtime 变 → 下次请求新结果。
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(
+        t.join("src/u/f/api.ts"),
+        "export default { get() { json.ok({ v: 2 }); } };\n",
+    )
+    .unwrap();
+    let (_, v) = req(addr, "GET", "/v1/api/u/f/", None).await;
+    assert_eq!(v["data"]["v"], 2, "{v}");
+    let _ = std::fs::remove_dir_all(&t);
+}
