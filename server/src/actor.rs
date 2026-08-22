@@ -8,12 +8,26 @@ use mdm_base_rust::bridge::{Bridge, Capture, RequestInfo};
 use tokio::sync::{mpsc, oneshot};
 
 /// 一次 handler 执行请求。
-pub struct Job {
-    pub source: String,
-    pub req: RequestInfo,
-    pub timeout: Option<std::time::Duration>,
-    pub resp: oneshot::Sender<Result<Capture, RunFail>>,
+pub enum Job {
+    /// 源码执行（per-request 源码字符串）。
+    Source {
+        source: String,
+        req: RequestInfo,
+        timeout: Option<std::time::Duration>,
+        resp: oneshot::Sender<Result<Capture, RunFail>>,
+    },
+    /// ESM 模块执行（oj server 路径）。
+    Module {
+        path: std::path::PathBuf,
+        method: String,
+        req: RequestInfo,
+        timeout: Option<std::time::Duration>,
+        resp: oneshot::Sender<Result<Capture, RunFail>>,
+    },
 }
+
+/// run_module 无不限时变体：None 用远大于配置的哨兵（对齐 run 的 None 语义）。
+const NO_TIMEOUT_SENTINEL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// 执行失败（区分超时熔断 408 与普通失败 500）。
 #[derive(Debug, Clone)]
@@ -68,22 +82,33 @@ impl JsActor {
                     let bridge = make();
                     rt.block_on(async move {
                         while let Some(job) = rx.recv().await {
-                            let out = match job.timeout {
-                                Some(t) => {
-                                    bridge
-                                        .run_with_timeout(&job.source, job.req, t)
-                                        .await
-                                        .map_err(RunFail::from)
+                            let (out, resp) = match job {
+                                Job::Source { source, req, timeout, resp } => {
+                                    let out = match timeout {
+                                        Some(t) => bridge
+                                            .run_with_timeout(&source, req, t)
+                                            .await
+                                            .map_err(RunFail::from),
+                                        None => bridge
+                                            .run_with(&source, req)
+                                            .await
+                                            .map_err(|e| RunFail {
+                                                msg: e.to_string(),
+                                                timeout: false,
+                                            }),
+                                    };
+                                    (out, resp)
                                 }
-                                None => bridge
-                                    .run_with(&job.source, job.req)
-                                    .await
-                                    .map_err(|e| RunFail {
-                                        msg: e.to_string(),
-                                        timeout: false,
-                                    }),
+                                Job::Module { path, method, req, timeout, resp } => {
+                                    let t = timeout.unwrap_or(NO_TIMEOUT_SENTINEL);
+                                    let out = bridge
+                                        .run_module(&path, &method, req, t)
+                                        .await
+                                        .map_err(RunFail::from);
+                                    (out, resp)
+                                }
                             };
-                            let _ = job.resp.send(out);
+                            let _ = resp.send(out);
                         }
                     });
                 })
@@ -106,8 +131,37 @@ impl JsActor {
         let (tx, rx) = oneshot::channel();
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
         self.senders[i]
-            .send(Job {
+            .send(Job::Source {
                 source: source.into(),
+                req,
+                timeout,
+                resp: tx,
+            })
+            .await
+            .map_err(|_| RunFail {
+                msg: "js actor stopped".into(),
+                timeout: false,
+            })?;
+        rx.await.map_err(|_| RunFail {
+            msg: "js actor dropped job".into(),
+            timeout: false,
+        })?
+    }
+
+    /// ESM 模块执行（oj server 路径）。
+    pub async fn run_module(
+        &self,
+        path: std::path::PathBuf,
+        method: String,
+        req: RequestInfo,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Capture, RunFail> {
+        let (tx, rx) = oneshot::channel();
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+        self.senders[i]
+            .send(Job::Module {
+                path,
+                method,
                 req,
                 timeout,
                 resp: tx,

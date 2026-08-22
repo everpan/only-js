@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 /// 目录镜像路由器。ts=true（--dev）找 api.ts，否则 api.js。
+#[derive(Clone)]
 pub struct Routes {
     base: String,
     root: PathBuf,
@@ -76,7 +77,6 @@ fn walk(dir: &Path, ext: &str, rel: &mut Vec<String>, acc: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn fixture(files: &[&str]) -> std::path::PathBuf {
         let base = std::env::temp_dir().join(format!(
