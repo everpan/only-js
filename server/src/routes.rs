@@ -13,7 +13,7 @@ pub struct Routes {
 impl Routes {
     pub fn new(base: &str, root: impl Into<PathBuf>, ts: bool) -> Self {
         // 归一 base：保证前后各一个 '/'（"/v1/api" 与 "/v1/api/" 等价）。
-        let base = format!("/{}", base.trim_matches('/'));
+        let base = format!("/{}/", base.trim_matches('/'));
         Self { base, root: root.into(), ts }
     }
 
@@ -111,6 +111,7 @@ mod tests {
         assert_eq!(r.resolve("/v1/api//dbl/"), None);
         assert_eq!(r.resolve("/other/base/user/account/"), None);
         assert_eq!(r.resolve("/v1/api/"), None);
+        assert_eq!(r.resolve("/v1/apifoo/user/"), None);
     }
 
     #[test]
