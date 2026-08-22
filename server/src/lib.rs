@@ -1,7 +1,6 @@
 //! mdm-server：HTTP 层。路由解析（router）+ JS actor 线程桥（actor）+ axum 装配（本文件）。
 
 pub mod actor;
-pub mod devserver;
 pub mod router;
 pub mod ws;
 
