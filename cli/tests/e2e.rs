@@ -201,3 +201,103 @@ async fn uc14_transpile_cache_and_hot_reload() {
     assert_eq!(v["data"]["v"], 2, "{v}");
     let _ = std::fs::remove_dir_all(&t);
 }
+
+// —— 负向用例（spec §5.7 错误表 404/405/500/408）—— //
+
+/// 临时项目：config_dir 用绝对路径（钳制要求 project_root ⊇ 模块目录）。
+fn tmp_project(files: &[(&str, &str)]) -> PathBuf {
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let t = std::env::temp_dir().join(format!(
+        "oj-neg-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&t);
+    std::fs::create_dir_all(&t).unwrap();
+    for (rel, c) in files {
+        let p = t.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, c).unwrap();
+    }
+    t
+}
+
+/// 最小可用配置（port 0 随机端口；default 内存库）。
+fn base_cfg() -> Config {
+    let mut cfg = Config::default();
+    cfg.server.port = 0;
+    cfg.db.insert("default".into(), "sqlite::memory:".into());
+    cfg
+}
+
+const MANIFEST: &str = "name: u\ndesc: d\nversion: 0.1.0\n";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc7_manifest_mismatch_blocks_startup() {
+    let _g = lock();
+    let t = tmp_project(&[("src/order/manifest.yaml", "name: orderr\ndesc: d\nversion: 0.1.0\n")]);
+    let e = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .err()
+        .unwrap_or_default();
+    assert!(e.contains("orderr") && e.contains("order"), "{e}");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc10_404_and_405_and_traversal() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        ("src/u/f/api.ts", "export default { get() { json.ok({}); } };\n"),
+    ]);
+    let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+    let (s, _) = req(addr, "GET", "/v1/api/none/here/", None).await;
+    assert_eq!(s, 404);
+    let (s, v) = req(addr, "DELETE", "/v1/api/u/f/", None).await;
+    assert_eq!(s, 405);
+    assert!(v["msg"].as_str().unwrap().contains("del"), "{v}");
+    // 目录穿越按 404（url crate 将 ../ 归一化为 /v1/etc/，同样落 404 信封）。
+    let (s, _) = req(addr, "GET", "/v1/api/../etc/", None).await;
+    assert_eq!(s, 404);
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc11_compile_error_envelope() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        ("src/u/f/api.ts", "function {{{{\nexport default {};\n"),
+    ]);
+    let (addr, _h) = server_cmd::start(base_cfg(), &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+    let (s, v) = req(addr, "GET", "/v1/api/u/f/", None).await;
+    assert_eq!(s, 500);
+    assert!(v["msg"].as_str().unwrap_or("").contains("api.ts"), "{v}");
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uc12_timeout_408_server_survives() {
+    let _g = lock();
+    let t = tmp_project(&[
+        ("src/u/manifest.yaml", MANIFEST),
+        ("src/u/loop/api.ts", "export default { get() { while (true) {} } };\n"),
+        ("src/u/ok/api.ts", "export default { get() { json.ok({ alive: true }); } };\n"),
+    ]);
+    let mut cfg = base_cfg();
+    cfg.server.timeout = "300ms".into();
+    let (addr, _h) = server_cmd::start(cfg, &t, t.join("src"), "/v1/api".into(), true)
+        .await
+        .unwrap();
+    let (s, _) = req(addr, "GET", "/v1/api/u/loop/", None).await;
+    assert_eq!(s, 408);
+    let (s, v) = req(addr, "GET", "/v1/api/u/ok/", None).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["data"]["alive"], true, "{v}");
+    let _ = std::fs::remove_dir_all(&t);
+}

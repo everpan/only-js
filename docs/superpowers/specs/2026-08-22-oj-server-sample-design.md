@@ -236,3 +236,28 @@ redis:
 - 粗略实施顺序（供 writing-plans 细化）：M1 oj 骨架+config+路由 → M2 ESM
   执行+转译+缓存（含 R1/R2 spike）→ M3 import 相对+裸+CJS → M4 sample 全量
   + UC 集成测试 → M5 删旧（devserver/旧 router/旧 config）+ 双绿收尾。
+
+## 8. 收官注记（2026-08-22，实施完成）
+
+**状态：** 已实现，`oj server` + user/order sample 全量验收通过，debug/release 双绿
+（61 passed + 1 ignored × 2）。commit 链 `587ad16..61ee89e`，实现记录见 `docs/cli2.md`。
+
+**偏差（实施期裁决）：**
+
+| # | spec 原定 | 实际 | 原因 |
+|---|---|---|---|
+| D1 | sample 用 `nanoid` 生成单号 | vendored `escape-goat`（`escapeHtml`） | 裸 deno_core 无 `crypto.getRandomValues`，无法跑 `nanoid` |
+| D2 | sample 端口 778 | 9778 | macOS 特权端口 778 无法 bind（EACCES） |
+| D3 | `-d` 相对 config_dir | 相对 CWD | 参数语义沿用「进程 CWD」，未 join config_dir（UX 痣，已记录） |
+| D4 | `DELETE→del` 走 `load_main_es_module_from_code` | `load_side_es_module_from_code` | deno_core 每 JsRuntime 仅一个 main module；池化复用下逐请求 driver specifier 递增会撞 MainModuleAlreadyExists |
+
+**计划级修正（TDD 过程中发现）：**
+- T1 dev 默认语义：无 `--dev` = release/dist（计划测试元组 `("src",true)` 系笔误）。
+- T12 seed.sql 补分号（计划拆分器按 `;` 切分）。
+- T9 one-main-module 缺陷（上表 D4）。
+
+**风险复盘：** R1（ESM 下 KillSwitch 408）与 R2（side-module 驱动）均在实现期 spike 验证；
+R4（escape-goat ESM-only）经引入验证为真并落地 D1 替代方案。
+
+**遗留（终审待裁）：** `oj server -c config.yaml` 相对路径 → `config_dir=""` → project_root
+钳制静默失效；`load_modules` 缺失模块目录回落空（削弱 fail-fast）。
