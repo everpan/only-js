@@ -1,0 +1,221 @@
+//! oj server 装配：config → 逐 db 开库（仅 sqlite）→ seed → manifest 校验 →
+//! actor 池 → axum serve。start() 返回 (addr, join_handle)，main 与测试共用。
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use mdm_base_rust::bridge::{
+    Bridge, DataAccessor, InMemoryKV, LoaderShared, SchemaRegistry, SqlxAccessor,
+};
+use mdm_base_rust::config::{self, Config};
+use mdm_server::actor::JsActor;
+use mdm_server::routes;
+
+use crate::args::ServerArgs;
+use crate::manifest;
+
+pub async fn run(a: ServerArgs) -> Result<(), String> {
+    let config_path = PathBuf::from(&a.config);
+    let config_dir = config_dir_of(&config_path);
+    let cfg = config::load_from(&config_dir, config_path.file_name().and_then(|s| s.to_str()))
+        .map_err(|e| format!("load config: {e}"))?;
+    let (addr, h) = start(cfg, &config_dir, PathBuf::from(&a.dir), a.base.clone(), a.dev).await?;
+    println!(
+        "oj server listening on http://{addr}{} (dir={}, {})",
+        a.base, a.dir, if a.dev { "dev/ts" } else { "release/js" }
+    );
+    h.await.map_err(|e| format!("server task: {e}"))
+}
+
+/// 装配并监听（port=0 → 随机端口，测试用）。
+pub async fn start(
+    cfg: Config,
+    config_dir: &Path,
+    dir: PathBuf,
+    base: String,
+    ts: bool,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
+    for (name, url) in &cfg.redis {
+        eprintln!("warn: redis '{name}' ({url}) configured but served by in-memory KV (v0.1)");
+    }
+    // 逐 db 开库：v0.1 仅 sqlite，其余 fail-fast。
+    let mut dbs: HashMap<String, Arc<dyn DataAccessor>> = HashMap::new();
+    for (name, dsn) in &cfg.db {
+        let acc = SqlxAccessor::arc(&resolve_sqlite(dsn, config_dir)?)
+            .await
+            .map_err(|e| format!("open db '{name}': {e}"))?;
+        dbs.insert(name.clone(), acc);
+    }
+    // 项目根 seed.sql（存在则对 default 库执行，语句按 ';' 切分——ponytail: seed 内不得有分号字面量）。
+    let seed = config_dir.join("seed.sql");
+    if seed.is_file() {
+        let text = std::fs::read_to_string(&seed).map_err(|e| format!("read seed: {e}"))?;
+        if let Some(db) = dbs.get("default") {
+            for stmt in text.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                db.exec_with_params(stmt, &[]).await.map_err(|e| format!("seed: {e}"))?;
+            }
+        }
+    }
+    // manifest 校验 + 路由表打印（UC-8）。
+    for m in manifest::load_modules(&dir)? {
+        println!("module {} v{} — {}", m.name, m.version, m.desc);
+    }
+    for r in routes::route_table(&dir, ts) {
+        println!("  {base}/{r}/");
+    }
+    // 绝对化 dir（Bridge loader 的 project_root 用 config_dir，api 相对 dir）。
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let loader = Arc::new(LoaderShared {
+        project_root: config_dir.canonicalize().unwrap_or_else(|_| config_dir.to_path_buf()),
+        ts,
+    });
+    let kv = Arc::new(InMemoryKV::new());
+    let n = cfg.server.pool_size.max(1) as usize;
+    let timeout = config::parse_duration(&cfg.server.timeout).ok();
+    let actor = JsActor::pool(n, {
+        let (dbs, kv, loader) = (dbs.clone(), kv.clone(), loader.clone());
+        move || {
+            Bridge::with_dbs_and_loader(
+                dbs.clone(),
+                kv.clone(),
+                SchemaRegistry::new(),
+                false,
+                Some(loader.clone()),
+            )
+        }
+    });
+    let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
+    // localhost → 127.0.0.1 解析；阻塞 resolve 仅启动一次，可接受——ponytail。
+    let addr = to_socket_addrs_sync(&addr)?;
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| format!("bind: {e}"))?;
+    let bound = listener.local_addr().map_err(|e| format!("local_addr: {e}"))?;
+    let h = tokio::spawn(async move {
+        let _ = mdm_server::serve_with_listener(listener, &base, dir, ts, actor, timeout).await;
+    });
+    Ok((bound, h))
+}
+
+/// config 文件的父目录（即 project_root）。bare 文件名（`parent()==""`）回落当前目录，
+/// 避免 config_dir 为空 → `canonicalize("")` 失败 → project_root 钳制静默失效。
+fn config_dir_of(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
+/// `host:port` → 首个解析地址（阻塞式，仅启动调用一次）。
+fn to_socket_addrs_sync(s: &str) -> Result<SocketAddr, String> {
+    s.to_socket_addrs()
+        .map_err(|e| format!("resolve {s}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("resolve {s}: no addresses"))
+}
+
+/// DSN 归一：非 sqlite 报错；相对路径相对 config_dir；内存库原样。
+fn resolve_sqlite(dsn: &str, config_dir: &Path) -> Result<String, String> {
+    let rest = dsn.strip_prefix("sqlite://").or_else(|| {
+        if dsn == "sqlite::memory:" { Some("") } else { None }
+    });
+    let Some(rest) = rest else {
+        return Err(format!("v0.1 supports only sqlite:// DSN (got '{dsn}')"));
+    };
+    if rest.is_empty() {
+        return Ok("sqlite::memory:".into()); // sqlite://（空）视作内存
+    }
+    if rest.starts_with(':') || rest.starts_with("//") {
+        return Ok(dsn.to_string());
+    }
+    let p = Path::new(rest);
+    let p = if p.is_absolute() { p.to_path_buf() } else { config_dir.join(p) };
+    // sqlx 默认 create_if_missing=false：文件库不存在则建零长空库（sqlite 视作有效空 DB）。
+    if !p.is_file() {
+        std::fs::write(&p, b"").map_err(|e| format!("create db file {}: {e}", p.display()))?;
+    }
+    Ok(format!("sqlite://{}", p.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Tmp(PathBuf);
+    fn tmpdir(tag: &str) -> Tmp {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        use std::sync::atomic::Ordering;
+        let d = std::env::temp_dir().join(format!(
+            "oj-sc-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        Tmp(d)
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn config_dir_never_empty() {
+        // bare 文件名回落当前目录（project_root 钳制不因空路径失效）。
+        assert_eq!(config_dir_of(Path::new("config.yaml")), PathBuf::from("."));
+        assert_eq!(config_dir_of(Path::new("./config.yaml")), PathBuf::from("."));
+        assert_eq!(config_dir_of(Path::new("sub/config.yaml")), PathBuf::from("sub"));
+        assert_eq!(config_dir_of(Path::new("/abs/config.yaml")), PathBuf::from("/abs"));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_sqlite_dsn_at_startup() {
+        let mut cfg = Config::default();
+        cfg.db.insert("default".into(), "mysql://u:p@localhost/test".into());
+        let e = start(cfg, Path::new("/tmp"), PathBuf::from("src"), "/v1/api".into(), true)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("sqlite"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn manifest_mismatch_blocks_startup() {
+        let t = tmpdir("sc-md");
+        std::fs::create_dir_all(t.0.join("src/user")).unwrap();
+        std::fs::write(t.0.join("src/user/manifest.yaml"), "name: x\ndesc: d\nversion: 0.1.0\n").unwrap();
+        let e = start(Config::default(), &t.0, t.0.join("src"), "/v1/api".into(), true)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(e.contains("name"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn seeds_and_serves_sqlite() {
+        let t = tmpdir("sc-seed");
+        std::fs::write(
+            t.0.join("seed.sql"),
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT);\n\
+             INSERT OR IGNORE INTO t (id, v) VALUES (1, 'a');\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.server.port = 0; // 随机端口
+        cfg.db.insert("default".into(), format!("sqlite://{}/db.sqlite", t.0.display()));
+        let (addr, _h) = start(cfg, &t.0, t.0.join("src"), "/v1/api".into(), true).await.unwrap();
+        // 直接打一个临时 api.ts 验证全链路。
+        std::fs::create_dir_all(t.0.join("src/u/f")).unwrap();
+        std::fs::write(
+            t.0.join("src/u/f/api.ts"),
+            "export default { get() { db.query(\"select v from t where id = ?\", [1]).then(r => json.ok(r)); } };\n",
+        )
+        .unwrap();
+        let resp = reqwest::get(format!("http://{addr}/v1/api/u/f/")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(v["data"][0]["v"], "a", "{v}");
+    }
+}

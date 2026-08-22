@@ -1,5 +1,5 @@
 [workspace]
-members = ["server"]
+members = ["server", "cli"]
 
 [package]
 name = "mdm-base-rust"
@@ -31,6 +31,7 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "net", "io-util", "
 tokio-tungstenite = "0.30"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+deno_ast = { version = "0.53.3", features = ["transpiling"] }
 
 [dev-dependencies]
 criterion = "0.5"

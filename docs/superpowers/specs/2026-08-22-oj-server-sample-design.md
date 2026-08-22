@@ -70,7 +70,11 @@ KillSwitch 408 熔断、actor 线程桥、axum 装配。
 | UC-12 | 408 熔断 | `while(true)` → 408，server 存活（ESM 模型下复验） | 临时文件用例 |
 | UC-13 | import 链路 | 相对导入工具函数参与处理（含跨模块 `../../`）；裸 specifier 解析失败报错含提示 | `user/_shared`、`order/*` |
 | UC-14 | 缓存与热重载 | 同路由连打 → 转译计数仅 1；改 api.ts → 下次请求新结果 | 计数器/日志断言 |
-| UC-15 | 裸 specifier | vendored `nanoid` import 生成订单号；不存在的包报「node_modules 未安装？」 | `order/account` |
+| UC-15 | 裸 specifier | vendored `escape-goat` import 转义订单号；不存在的包报「node_modules 未安装？」 | `order/account` |
+
+> 偏差（实现期）：vendored 包由 nanoid 改为 escape-goat——裸 deno_core 无
+> `crypto.getRandomValues`（Web API 由 Deno CLI 扩展提供，core 不含），nanoid v5
+> 依赖它；escape-goat 纯字符串操作、零依赖。UC-15 语义不变（裸 specifier 参与请求处理）。
 
 ## 4. sample 设计（文件级）
 
@@ -78,8 +82,8 @@ KillSwitch 408 熔断、actor 线程桥、axum 装配。
 sample/
 ├── config.yaml            # server.host/port + db.default + redis.default
 ├── seed.sql               # 建表 account(id,name,role)/orders(id,no,account_id,amount) + 种子，幂等
-├── package.json           # 声明 nanoid（vendored）
-├── node_modules/nanoid/   # 直接 vendor 提交（纯 ESM 两文件，测试零网络）
+├── package.json           # 声明 escape-goat（vendored）
+├── node_modules/escape-goat/   # 直接 vendor 提交（纯 ESM 两文件，测试零网络）
 ├── .gitignore             # db.sqlite
 ├── src/
 │   ├── user/
@@ -90,7 +94,7 @@ sample/
 │   │       └── detail/api.ts   # UC-4：三层嵌套镜像
 │   ├── order/
 │   │   ├── manifest.yaml  # name: "order"
-│   │   ├── account/api.ts # UC-15：nanoid 生成订单号（建单）
+│   │   ├── account/api.ts # UC-15：escape-goat 转义订单号（建单）
 │   │   ├── list/api.ts    # UC-5：join account；import user/_shared（跨模块）
 │   │   └── detail/api.ts  # UC-9：kv miss→db→set
 │   └── _shared/…          # 仅 user 模块内：见下
@@ -220,7 +224,7 @@ redis:
 | R1 | ESM/TLA 模型下 KillSwitch 408 是否仍有效 | 实现期第一个 spike：UC-12 E2E 先行 |
 | R2 | deno_core 模块加载精确机制（load_main_module vs dynamic-import driver、per-request dispatch、完成判定与事件循环泵） | 实现期 spike，回退路径：TLA 主模块 + mod_evaluate |
 | R3 | hash specifier 旧模块不可卸载 | 有界说明（编辑次数 × actor 数），接受 |
-| R4 | vendored nanoid 纯 ESM 假设 | 引入时验证（nanoid v5 ESM-only，两文件） |
+| R4 | vendored escape-goat 纯 ESM 假设 | 引入时验证（escape-goat v4 ESM-only，两文件） |
 
 ## 7. 测试计划
 
@@ -232,3 +236,30 @@ redis:
 - 粗略实施顺序（供 writing-plans 细化）：M1 oj 骨架+config+路由 → M2 ESM
   执行+转译+缓存（含 R1/R2 spike）→ M3 import 相对+裸+CJS → M4 sample 全量
   + UC 集成测试 → M5 删旧（devserver/旧 router/旧 config）+ 双绿收尾。
+
+## 8. 收官注记（2026-08-22，实施完成）
+
+**状态：** 已实现，`oj server` + user/order sample 全量验收通过，debug/release 双绿
+（61 passed + 1 ignored × 2）。commit 链 `587ad16..61ee89e`，实现记录见 `docs/cli2.md`。
+
+**偏差（实施期裁决）：**
+
+| # | spec 原定 | 实际 | 原因 |
+|---|---|---|---|
+| D1 | sample 用 `nanoid` 生成单号 | vendored `escape-goat`（`escapeHtml`） | 裸 deno_core 无 `crypto.getRandomValues`，无法跑 `nanoid` |
+| D2 | sample 端口 778 | 9778 | macOS 特权端口 778 无法 bind（EACCES） |
+| D3 | `-d` 相对 config_dir | 相对 CWD | 参数语义沿用「进程 CWD」，未 join config_dir（UX 痣，已记录） |
+| D4 | `DELETE→del` 走 `load_main_es_module_from_code` | `load_side_es_module_from_code` | deno_core 每 JsRuntime 仅一个 main module；池化复用下逐请求 driver specifier 递增会撞 MainModuleAlreadyExists |
+
+**计划级修正（TDD 过程中发现）：**
+- T1 dev 默认语义：无 `--dev` = release/dist（计划测试元组 `("src",true)` 系笔误）。
+- T12 seed.sql 补分号（计划拆分器按 `;` 切分）。
+- T9 one-main-module 缺陷（上表 D4）。
+
+**风险复盘：** R1（ESM 下 KillSwitch 408）与 R2（side-module 驱动）均在实现期 spike 验证；
+R4（escape-goat ESM-only）经引入验证为真并落地 D1 替代方案。
+
+**终审裁决（集中 review）：**
+- `oj server -c config.yaml`（bare 文件名）→ `config_dir=""` → 钳制失效 → **已修复**（`config_dir_of` 回落 `.`，commit `48b57da`）。
+- `load_modules` 缺失模块目录回落空 → **保留**（brief 自身 seeds 测试依赖；空项目合法；`-d` 拼错可由空路由表察觉）。
+- 其余 deferred minors（T4 尾斜杠归一、T5 http.param 原型链、T6 sourcemap 体积/计数含失败 parse、T7 with_extension 吃 `.min`、module_loader 绝对 file:// 绕过钳制）→ **接受**为 v0.1 已知限制（信任模型：所服务即开发者自有代码，clamp 为纵深防御非沙箱）。

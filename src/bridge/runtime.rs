@@ -14,8 +14,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use deno_core::{JsRuntime, PollEventLoopOptions, RuntimeOptions, v8};
+use deno_core::{JsRuntime, ModuleLoader, PollEventLoopOptions, RuntimeOptions, v8};
 
+use super::module_loader::OjModuleLoader;
 use super::{StableState, bridge_ext};
 
 /// 池容量上限（空闲实例数）。设为 0 表示无上限（按需增长后保留）。
@@ -36,9 +37,14 @@ impl RuntimePool {
     pub fn new(stable: Arc<StableState>, inspect: bool) -> Self {
         Self {
             make: Box::new(move || {
+                // 模块加载器取 StableState.loader（单一事实来源；devserver 旧路径 None → 不配）。
+                let module_loader = stable.loader.clone().map(|inner| {
+                    Rc::new(OjModuleLoader { inner }) as Rc<dyn ModuleLoader>
+                });
                 JsRuntime::new(RuntimeOptions {
                     extensions: vec![bridge_ext::init(stable.clone())],
                     inspector: inspect,
+                    module_loader,
                     ..Default::default()
                 })
             }),

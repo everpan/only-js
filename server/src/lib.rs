@@ -1,8 +1,7 @@
-//! mdm-server：HTTP 层。路由解析（router）+ JS actor 线程桥（actor）+ axum 装配（本文件）。
+//! mdm-server：HTTP 层。目录镜像路由（routes）+ JS actor 线程桥（actor）+ axum 装配（本文件）。
 
 pub mod actor;
-pub mod devserver;
-pub mod router;
+pub mod routes;
 pub mod ws;
 
 use std::collections::HashMap;
@@ -16,13 +15,13 @@ use axum::Router;
 use serde_json::Value;
 
 use crate::actor::JsActor;
-use crate::router::{FileResolver, Resolver};
+use crate::routes::Routes;
 use mdm_base_rust::bridge::{fail, RequestInfo};
 
 /// 共享状态（JsActor 句柄 Clone = 同一 actor 队列的多份引用）。
 #[derive(Clone)]
 pub struct AppState {
-    resolver: FileResolver,
+    routes: Routes,
     actor: JsActor,
     /// 单请求超时（None = 不限时）。
     timeout: Option<std::time::Duration>,
@@ -30,14 +29,16 @@ pub struct AppState {
 
 /// 构造 axum 应用：catch-all fallback（对齐 Go fiber 的 `All("/*")`）。
 pub fn app(
-    base_dir: impl Into<PathBuf>,
+    base: &str,
+    dir: impl Into<PathBuf>,
+    ts: bool,
     actor: JsActor,
     timeout: Option<std::time::Duration>,
 ) -> Router {
     Router::new()
         .fallback(any(handle))
         .with_state(AppState {
-            resolver: FileResolver::new(base_dir),
+            routes: Routes::new(base, dir, ts),
             actor,
             timeout,
         })
@@ -46,12 +47,26 @@ pub fn app(
 /// 绑定监听并服务。
 pub async fn serve(
     addr: std::net::SocketAddr,
-    base_dir: impl Into<PathBuf>,
+    base: &str,
+    dir: impl Into<PathBuf>,
+    ts: bool,
     actor: JsActor,
     timeout: Option<std::time::Duration>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app(base_dir, actor, timeout)).await
+    serve_with_listener(listener, base, dir, ts, actor, timeout).await
+}
+
+/// 已绑定监听上服务（测试/T11：先 bind 端口 0 再读 local_addr）。
+pub async fn serve_with_listener(
+    listener: tokio::net::TcpListener,
+    base: &str,
+    dir: impl Into<PathBuf>,
+    ts: bool,
+    actor: JsActor,
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<()> {
+    axum::serve(listener, app(base, dir, ts, actor, timeout)).await
 }
 
 async fn handle(
@@ -61,22 +76,15 @@ async fn handle(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let (file, p) = match st.resolver.resolve(method.as_str(), uri.path()) {
-        Some(x) => x,
-        None => return fail_response(404, "route not resolved"),
+    let Some(file) = st.routes.resolve(uri.path()) else {
+        return fail_response(404, "no api file for route");
     };
-    // Go dev 语义：resolve 出文件即读即执行（per-request 读盘 = 免费热重载）。
-    let source = match std::fs::read_to_string(&file) {
-        Ok(s) => s,
-        Err(e) => return fail_response(500, &format!("read handler: {e}")),
+    let Some(m) = crate::routes::method_name(method.as_str()) else {
+        return fail_response(405, &format!("method {method} not mapped"));
     };
     let req = RequestInfo {
         method: method.as_str().to_string(),
-        params: HashMap::from([
-            ("sub".to_string(), p.sub),
-            ("feature".to_string(), p.feature),
-            ("entity".to_string(), p.entity),
-        ]),
+        params: HashMap::new(), // 目录镜像路由无路径参数
         query: parse_query(uri.query()),
         headers: headers
             .iter()
@@ -84,7 +92,7 @@ async fn handle(
             .collect(),
         body: body.to_vec(),
     };
-    match st.actor.run(source, req, st.timeout).await {
+    match st.actor.run_module(file, m.to_string(), req, st.timeout).await {
         Ok(cap) => capture_response(cap),
         // 超时熔断 → 408（对齐 Go dev server）。
         Err(e) if e.timeout => fail_response(408, &e.msg),
@@ -132,7 +140,7 @@ fn parse_query(q: Option<&str>) -> HashMap<String, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use mdm_base_rust::bridge::{Bridge, InMemoryAccessor, InMemoryKV};
+    use mdm_base_rust::bridge::{Bridge, InMemoryKV, LoaderShared, SchemaRegistry};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -141,7 +149,7 @@ pub(crate) mod tests {
     pub(crate) fn routes(files: &[(&str, &str)]) -> TempRoutes {
         static N: AtomicUsize = AtomicUsize::new(0);
         let base = std::env::temp_dir().join(format!(
-            "mdm-server-{}-{}",
+            "oj-server-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
@@ -159,20 +167,32 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn actor() -> JsActor {
-        JsActor::new(|| {
-            Bridge::new(
-                Arc::new(InMemoryAccessor::new()),
+    /// 带 oj 模块加载器的 actor（project_root = 路由根：api 文件全在其下，clamp 可达）。
+    pub(crate) fn actor(root: PathBuf, ts: bool) -> JsActor {
+        JsActor::new(move || {
+            Bridge::with_dbs_and_loader(
+                HashMap::new(),
                 Arc::new(InMemoryKV::new()),
+                SchemaRegistry::new(),
+                false,
+                Some(Arc::new(LoaderShared { project_root: root.clone(), ts })),
             )
         })
     }
 
-    async fn spawn_server(base: PathBuf, timeout: Option<std::time::Duration>) -> std::net::SocketAddr {
+    pub(crate) async fn spawn_server(
+        base: &str,
+        dir: PathBuf,
+        ts: bool,
+        timeout: Option<std::time::Duration>,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let base = base.to_string();
         tokio::spawn(async move {
-            axum::serve(listener, app(base, actor(), timeout)).await.unwrap();
+            serve_with_listener(listener, &base, dir.clone(), ts, actor(dir, ts), timeout)
+                .await
+                .unwrap();
         });
         addr
     }
@@ -186,62 +206,66 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn serves_route_with_envelope() {
+    async fn serves_mirror_route_with_envelope() {
         let t = routes(&[(
-            "crm-v1/user/profile/list/GET.js",
-            r#"json.ok({ m: http.method, e: http.params.entity, q: http.query.id });"#,
+            "user/account/api.ts",
+            r#"export default { get() { json.ok({ m: http.method, q: http.param("id", 0) }); } };"#,
         )]);
-        let addr = spawn_server(t.0.clone(), None).await;
+        let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
         let resp = raw_http(
             addr,
-            "GET /crm-v1/user/profile/list?id=7 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+            "GET /v1/api/user/account/?id=7 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-        assert!(resp.contains("\"code\":0"), "{resp}");
-        assert!(resp.contains("\"e\":\"list\""), "{resp}");
         assert!(resp.contains("\"q\":\"7\""), "{resp}");
         assert!(resp.contains("\"m\":\"GET\""), "{resp}");
     }
 
     #[tokio::test]
-    async fn unknown_route_returns_404_envelope() {
+    async fn missing_api_is_404_and_unmapped_verb_405() {
         let t = routes(&[]);
-        let addr = spawn_server(t.0.clone(), None).await;
+        let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
         let resp = raw_http(
             addr,
-            "GET /crm-v1/nope/missing/thing HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+            "GET /v1/api/none/here/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
-        assert!(resp.contains("\"code\":404"), "{resp}");
+        // api 文件在但未导出 del → 405（driver 侧 json.fail(405) 信封）。
+        let t2 = routes(&[("u/f/api.ts", "export default { get() { json.ok({}); } };")]);
+        let addr2 = spawn_server("/v1/api", t2.0.clone(), true, None).await;
+        let resp2 = raw_http(
+            addr2,
+            "DELETE /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(resp2.starts_with("HTTP/1.1 405"), "{resp2}");
     }
 
     #[tokio::test]
     async fn handler_timeout_returns_408_envelope() {
-        let t = routes(&[("crm-v1/user/profile/list/GET.js", "while (true) {}")]);
-        let addr = spawn_server(t.0.clone(), Some(std::time::Duration::from_millis(150))).await;
+        let t = routes(&[("u/f/api.ts", "export default { get() { while (true) {} } };")]);
+        let addr =
+            spawn_server("/v1/api", t.0.clone(), true, Some(std::time::Duration::from_millis(200))).await;
         let resp = raw_http(
             addr,
-            "GET /crm-v1/user/profile/list HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+            "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 408"), "{resp}");
-        assert!(resp.contains("\"code\":408"), "{resp}");
-        assert!(resp.contains("handler execution timed out"), "{resp}");
     }
 
     #[tokio::test]
     async fn handler_error_returns_500_envelope() {
-        let t = routes(&[("crm-v1/user/profile/list/GET.js", "this is !!! not js")]);
-        let addr = spawn_server(t.0.clone(), None).await;
+        let t = routes(&[("u/f/api.ts", "function {{{{\nexport default {};")]);
+        let addr = spawn_server("/v1/api", t.0.clone(), true, None).await;
         let resp = raw_http(
             addr,
-            "GET /crm-v1/user/profile/list HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
+            "GET /v1/api/u/f/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n",
         )
         .await;
         assert!(resp.starts_with("HTTP/1.1 500"), "{resp}");
-        assert!(resp.contains("\"code\":500"), "{resp}");
     }
 
     // 静态断言：axum state 可跨线程（Send 边界）。

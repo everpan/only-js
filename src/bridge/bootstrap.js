@@ -2,7 +2,7 @@
 // Rust ops do I/O and state; this file shapes the JS-side API
 // (equivalent of the goja map[string]any bindings).
 //
-// Globals: json / db / DB / http / redis / log / fetch / finish
+// Globals: json / db / DB / http / redis / log / fetch / finish / __ojRequire
 // Plus safe query builder: db.table(name).select(...).where(...).orderBy(...).limit(...).all()
 // Not ported yet: ws, Redis(name), XORM(name).
 
@@ -19,7 +19,9 @@ import {
   op_json_ok,
   op_kv_get,
   op_kv_set,
+  op_kv_del,
   op_log,
+  op_resolve_cjs as __oj_resolve_cjs,
   op_ws_send,
   op_ws_close,
 } from "ext:core/ops";
@@ -34,10 +36,18 @@ globalThis.json = {
   header: (name, value) => op_json_header(String(name), String(value)),
 };
 
-// ----- http: current request context (lazy proxy; fresh per request) -----
+// ----- http helpers: current request context (lazy proxy; fresh per request) -----
 const httpInfo = () => op_http_info();
 globalThis.http = new Proxy({}, {
-  get: (_t, p) => httpInfo()[p],
+  get: (_t, p) => {
+    if (p === "param") {
+      return (name, def) => {
+        const v = httpInfo().query[name];
+        return v === undefined ? def : v;
+      };
+    }
+    return httpInfo()[p];
+  },
 });
 
 // ----- log: structured logging (msg + alternating key/value pairs, like zap SugaredLogger) -----
@@ -59,6 +69,13 @@ globalThis.log = {
 globalThis.redis = {
   get: (key) => op_kv_get(String(key)),
   set: (key, value) => op_kv_set(String(key), String(value)),
+};
+
+// ----- kv: same in-memory KV as redis global (spec name for oj handlers) -----
+globalThis.kv = {
+  get: (key) => op_kv_get(String(key)),
+  set: (key, value) => op_kv_set(String(key), String(value)),
+  del: (key) => op_kv_del(String(key)),
 };
 
 // ----- ws: WebSocket frame-loop control (send collected per frame, close ends conn; no-op outside WS) -----
@@ -141,3 +158,17 @@ globalThis.fetch = async function (url, options = {}) {
 
 // ----- finish: mark session done -----
 globalThis.finish = () => op_finish();
+
+// ----- __ojRequire: sync require() for CJS interop (eval + process-wide cache) -----
+const __ojReqCache = new Map();
+globalThis.__ojRequire = (name, referrerPath) => {
+  const key = referrerPath + "::" + name;
+  if (!__ojReqCache.has(key)) {
+    const resolved = __oj_resolve_cjs(name, referrerPath); // op: returns {path, code}
+    const fn = new Function("module", "exports", "require", resolved.code);
+    const m = { exports: {} };
+    fn(m, m.exports, (n) => globalThis.__ojRequire(n, resolved.path));
+    __ojReqCache.set(key, m.exports);
+  }
+  return __ojReqCache.get(key);
+};

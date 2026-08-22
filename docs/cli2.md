@@ -62,5 +62,17 @@
   ```
    以上代码通过包装 `oj build moduleA` 命令来编译，制品存放在 `dist`,`build`子命令为 `vite` 工具的包装。
 
+---
 
+## 实现记录（2026-08-22，commit `587ad16..61ee89e`）
 
+**状态：** v0.1 已实现，`oj server` + user/order sample 验收通过（debug/release 双绿）。
+
+- **子命令**：`server`（`-c/-b/-d/--dev`）已可用；`build` 与无命令仍为占位（v0.1 范围内）。
+- **路由镜像**：任意深度目录 → `api.ts`（dev）/ `api.js`（release）；动词全表（`DELETE→del`）；越界/穿越段按 404。
+- **执行模型**：deno_ast 转译（mtime 全局缓存）+ deno_core side-module 驱动（TLA driver `import` api 模块 → `default[method]`）。
+- **偏差**（见 spec 收官注记）：
+  - vendored `escape-goat` 替代 spec 原 `nanoid`（裸 deno_core 无 `crypto.getRandomValues`）。
+  - sample 端口 778 → 9778（macOS 特权端口）。
+  - `-d` 路径相对 CWD 而非 config_dir。
+- **测试**：debug 62 passed + 1 ignored；release 62 passed + 1 ignored（root/server/oj，含 E2E UC-1..15）。
