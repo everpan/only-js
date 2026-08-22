@@ -30,6 +30,7 @@ mod json;
 mod kv;
 mod loader;
 mod log;
+mod module_loader;
 mod query;
 mod registry;
 mod runtime;
@@ -44,6 +45,7 @@ pub use envelope::{fail, ok, status_code};
 pub use http::RequestInfo;
 pub use kv::{InMemoryKV, KVStore};
 pub use loader::HandlerStore;
+pub use module_loader::{LoaderShared, OjModuleLoader, versioned_specifier};
 pub use registry::SchemaRegistry;
 
 use std::cell::RefCell;
